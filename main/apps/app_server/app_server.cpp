@@ -1390,28 +1390,16 @@ esp_err_t app_server_init(void)
         strlcpy(g_dev_state.requested_mode, hal.settings.current_mode, sizeof(g_dev_state.requested_mode));
     }
 
-    /* WiFi events — additional listener, does not own the WiFi lifecycle */
+    /* WiFi events — additional listener, does not own the WiFi lifecycle. */
     WiFi.onEvent([](WiFiEvent ev, void *data) {
         switch (ev) {
             case WiFiEvent::STA_GOT_IP:
                 ESP_LOGI(TAG, ">>> STA GOT IP");
                 hal.statusEventSend(OPERATION_EVENT_STARTUP_SUCCESS);
                 break;
-            case WiFiEvent::AP_STA_CONNECTED: {
+            case WiFiEvent::AP_STA_CONNECTED:
                 ESP_LOGI(TAG, ">>> AP: station connected");
-                esp_err_t err = mdns_init();
-                if (err) {
-                    printf("MDNS Init failed: %d\n", err);
-                    break;
-                }
-                char device_name[sizeof(hal.settings.device_name)] = {0};
-                hal.settingsLock();
-                cstring_copy(device_name, hal.settings.device_name, sizeof(device_name));
-                hal.settingsUnlock();
-                mdns_hostname_set(device_name);
-                mdns_instance_name_set("PaperColor - Config Panel");
                 break;
-            }
             case WiFiEvent::AP_STA_DISCONNECTED:
                 ESP_LOGI(TAG, ">>> AP: station leaved");
                 break;
@@ -1448,6 +1436,36 @@ esp_err_t app_server_init(void)
         httpd_register_uri_handler(g_srv, &routes[i]);
     }
     httpd_register_err_handler(g_srv, HTTPD_404_NOT_FOUND, http_404_error_handler);
+
+    /* Initialize mDNS once at boot so the device is reachable as
+     * <device_name>.local on any active interface. Previously this only
+     * ran inside the AP_STA_CONNECTED event handler, which meant mDNS was
+     * only initialized when a station joined the device's softAP — so in
+     * STA-only operation (or before any phone ever joined the AP)
+     * <device_name>.local never resolved on the LAN. The mdns component
+     * subscribes to netif up/down events itself; calling mdns_init() once
+     * here is enough for both STA and AP traffic, and the hostname is
+     * already re-applied on rename from h_wifi_config. */
+    {
+        esp_err_t merr = mdns_init();
+        if (merr != ESP_OK) {
+            ESP_LOGW(TAG, "mdns_init failed: %s", esp_err_to_name(merr));
+        } else {
+            char device_name[sizeof(hal.settings.device_name)] = {0};
+            hal.settingsLock();
+            cstring_copy(device_name, hal.settings.device_name, sizeof(device_name));
+            hal.settingsUnlock();
+            if (!device_name[0]) {
+                cstring_copy(device_name, "papercolor", sizeof(device_name));
+            }
+            mdns_hostname_set(device_name);
+            mdns_instance_name_set("PaperColor - Config Panel");
+            /* Advertise an HTTP service so Bonjour-aware clients (Finder's
+             * Network sidebar, dns-sd -B _http._tcp, etc.) discover the
+             * device without needing to know its hostname. */
+            mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
+        }
+    }
 
     /* ==== Captive Portal Handlers ==== */
     // Reference: https://github.com/espressif/esp-idf/tree/v5.5/examples/protocols/http_server/captive_portal
