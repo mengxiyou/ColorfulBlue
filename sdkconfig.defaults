@@ -72,6 +72,12 @@ CONFIG_WL_SECTOR_SIZE_4096=y
 CONFIG_TINYUSB_MSC_ENABLED=y
 CONFIG_TINYUSB_MSC_BUFSIZE=4096
 CONFIG_TINYUSB_MSC_MOUNT_PATH="/data"
+# hal_storage.cpp uses TINYUSB_EVENT_SUSPENDED / TINYUSB_EVENT_RESUMED
+# unconditionally. esp_tinyusb >= 2.x gates those enum values behind these
+# Kconfigs; without them the build fails with
+#   "TINYUSB_EVENT_SUSPENDED was not declared in this scope"
+CONFIG_TINYUSB_SUSPEND_CALLBACK=y
+CONFIG_TINYUSB_RESUME_CALLBACK=y
 
 # ===== I2C Bus =====
 CONFIG_I2C_BUS_DYNAMIC_CONFIG=y
