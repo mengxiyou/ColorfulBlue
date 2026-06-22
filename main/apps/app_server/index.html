@@ -1268,6 +1268,10 @@ SPDX-License-Identifier: MIT
             <h1 class="page-title">Photo Slideshow</h1>
           </div>
 
+          <div id="storage-readonly-banner" class="card hidden" style="background:#fff8e1;border:1px solid #ffd54f;color:#5d4037;font-size:13px;padding:10px 14px;margin-bottom:12px;">
+            🔒 内置存储为只读 — 当前显示的是出厂自带的图片。插入 SD 卡后即可上传、删除、管理照片。
+          </div>
+
           <div class="mode-main-layout">
             <div class="mode-main-side">
               <div>
@@ -1520,6 +1524,20 @@ let photoPageCache = {};    // { [page]: { total_pages, names: [...] } }
 let photoCache = {};        // { [name]: { name, url } }
 let photoTotal = 0;
 let photoPageLoading = false;
+let photoReadonly = false;  // true when mounted media is internal flash (no upload/delete)
+
+function applyStorageReadonly() {
+  const banner = document.getElementById("storage-readonly-banner");
+  if (banner) banner.classList.toggle("hidden", !photoReadonly);
+  document.querySelectorAll(".upload-actions").forEach(el => {
+    el.classList.toggle("hidden", photoReadonly);
+  });
+  const preview = document.getElementById("preview-placeholder");
+  if (preview) {
+    preview.style.opacity = photoReadonly ? "0.4" : "";
+    preview.style.pointerEvents = photoReadonly ? "none" : "";
+  }
+}
 
 // ==================== API Helper ====================
 async function apiCall(method, url, body, isFormData) {
@@ -2831,6 +2849,8 @@ function bindWifiSsidInput() {
 async function loadStorage() {
   try {
     const info = await apiCall("GET", "/api/storage");
+    photoReadonly = !!info.readonly;
+    applyStorageReadonly();
     const pct = info.total > 0 ? (info.used / info.total * 100) : 0;
     const usedMB = (info.used / 1024 / 1024).toFixed(1);
     const totalMB = (info.total / 1024 / 1024).toFixed(1);
@@ -3276,6 +3296,10 @@ async function loadPhotoList(page, forceRefresh = false) {
       photoPage = data.page;
       photoTotalPages = data.total_pages;
       photoTotal = data.total;
+      if ("readonly" in data) {
+        photoReadonly = !!data.readonly;
+        applyStorageReadonly();
+      }
       renderPhotoGridFromNames(names);
       renderPagination();
     }
@@ -3317,12 +3341,15 @@ function renderPhotoGridFromNames(names) {
   }
   grid.innerHTML = names.map(name => {
     const p = photoCache[name] || { name, url: "" };
+    const delBtn = photoReadonly
+      ? ""
+      : `<button class="btn btn-danger btn-sm" onclick="deletePhoto('${escapeAttr(p.name)}')">Del</button>`;
     return `<div class="photo-card">
       <img class="thumb" src="${escapeHtml(p.url)}" alt="${escapeHtml(p.name)}" loading="lazy">
       <div class="photo-info"><div class="photo-name" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</div></div>
       <div class="photo-actions">
         <button class="btn btn-outline btn-sm" onclick="displayPhoto('${escapeAttr(p.name)}')">View</button>
-        <button class="btn btn-danger btn-sm" onclick="deletePhoto('${escapeAttr(p.name)}')">Del</button>
+        ${delBtn}
       </div>
     </div>`;
   }).join("");

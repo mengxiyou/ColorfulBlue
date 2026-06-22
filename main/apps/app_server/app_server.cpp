@@ -22,7 +22,6 @@
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "esp_vfs_fat.h"
-#include "tinyusb_msc.h"
 
 #include "hal/wifi/hal_wifi.h"
 #include "hal/storage/hal_storage.h"
@@ -587,7 +586,6 @@ static esp_err_t h_photos_list(httpd_req_t *req)
     }
 
     int total = 0;
-    hal_storage_prepare_photo_fs_access();
     hal_storage_lock();
     DIR *directory = opendir(BASE_PATH);
     if (directory) {
@@ -651,6 +649,7 @@ static esp_err_t h_photos_list(httpd_req_t *req)
     cJSON_AddNumberToObject(r, "page", page);
     cJSON_AddNumberToObject(r, "per_page", per);
     cJSON_AddNumberToObject(r, "total_pages", pages);
+    cJSON_AddBoolToObject(r, "readonly", hal_storage_get_media() == APP_STORAGE_MEDIA_SPIFLASH);
     send_json_response(req, r);
     cJSON_Delete(r);
     free(photos);
@@ -659,6 +658,9 @@ static esp_err_t h_photos_list(httpd_req_t *req)
 
 static esp_err_t h_photos_upload(httpd_req_t *req)
 {
+    if (hal_storage_get_media() == APP_STORAGE_MEDIA_SPIFLASH) {
+        return send_error_response(req, 403, "internal storage is read-only; insert SD card to upload");
+    }
     if (req->content_len > UPLOAD_MAX_SIZE) {
         return send_error_response(req, 400, "file too large");
     }
@@ -824,7 +826,6 @@ static esp_err_t h_photos_upload(httpd_req_t *req)
     }
 
     char fname[64];
-    hal_storage_prepare_photo_fs_access();
     hal_storage_lock();
     if (generate_next_photo_name(ext, algorithm, fname, sizeof(fname)) != ESP_OK) {
         hal_storage_unlock();
@@ -862,6 +863,9 @@ static esp_err_t h_photos_upload(httpd_req_t *req)
 
 static esp_err_t h_photos_delete(httpd_req_t *req)
 {
+    if (hal_storage_get_media() == APP_STORAGE_MEDIA_SPIFLASH) {
+        return send_error_response(req, 403, "internal storage is read-only; insert SD card to delete");
+    }
     char query_buffer[128];
     if (httpd_req_get_url_query_str(req, query_buffer, sizeof(query_buffer)) != ESP_OK) {
         return send_error_response(req, 400, "name required");
@@ -881,7 +885,6 @@ static esp_err_t h_photos_delete(httpd_req_t *req)
 
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s", BASE_PATH, decoded_name);
-    hal_storage_prepare_photo_fs_access();
     hal_storage_lock();
     int rc = unlink(path);
     hal_storage_unlock();
@@ -902,7 +905,6 @@ static esp_err_t h_storage(httpd_req_t *req)
     uint64_t free  = 0;
     uint64_t used  = 0;
 
-    hal_storage_prepare_photo_fs_access();
     if (esp_vfs_fat_info(BASE_PATH, &total, &free) == ESP_OK) {
         used = total - free;
     } else {
@@ -913,6 +915,7 @@ static esp_err_t h_storage(httpd_req_t *req)
     cJSON_AddNumberToObject(r, "total", (double)total);
     cJSON_AddNumberToObject(r, "used", (double)used);
     cJSON_AddNumberToObject(r, "free", (double)free);
+    cJSON_AddBoolToObject(r, "readonly", hal_storage_get_media() == APP_STORAGE_MEDIA_SPIFLASH);
 
     send_json_response(req, r);
     cJSON_Delete(r);
@@ -1083,7 +1086,6 @@ static esp_err_t h_photos_display(httpd_req_t *req)
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s", BASE_PATH, name);
     struct stat st;
-    hal_storage_prepare_photo_fs_access();
     if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
         cJSON_Delete(j);
         return send_error_response(req, 404, "not found");

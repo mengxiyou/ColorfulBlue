@@ -29,7 +29,6 @@ idf_component_register(
         console
         M5Unified
         M5GFX
-        tinyusb
 
 )
 

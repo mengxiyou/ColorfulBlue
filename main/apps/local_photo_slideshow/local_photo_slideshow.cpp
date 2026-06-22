@@ -448,7 +448,6 @@ void PhotoSlideshow::displayPhoto(uint16_t index)
     if (index >= _photo_list.size()) return;
     const char *path = _photo_list[index].c_str();
 
-    hal_storage_prepare_photo_fs_access();
     hal_storage_lock();
     if (!get_image_size_from_file(path, &image_width, &image_height)) {
         hal_storage_unlock();
@@ -525,7 +524,6 @@ void PhotoSlideshow::displayPhotoByPath(const char *path)
 bool PhotoSlideshow::scanPhotos()
 {
     _photo_list.clear();
-    hal_storage_prepare_photo_fs_access();
     hal_storage_lock();
     DIR *dir = opendir(_dir_path);
     if (!dir) {

@@ -274,7 +274,6 @@ static void show_wifi_config_qrcode(const char* ap_ssid)
 #else
     const char* bg_path = "/data/PaperColor.png";
     hal.Canvas->fillScreen(TFT_WHITE);
-    hal_storage_prepare_photo_fs_access();
     hal_storage_lock();
     if (get_image_size_from_file(bg_path, &img_w, &img_h)) {
         float s    = std::min((float)scr_w / img_w, (float)scr_h / img_h);
