@@ -62,3 +62,13 @@ void app_manager_mark_activity(void);
  * @param in_progress True while a refresh is running, otherwise false.
  */
 void app_manager_set_refresh_in_progress(bool in_progress);
+
+/**
+ * @brief Plays the shutdown chime, schedules the next RTC wake if a periodic
+ *        slideshow is configured (low_power_mode + auto_slideshow + interval),
+ *        and cuts PMIC power. Does not return.
+ *
+ * Intended for the front-panel C button: a tap powers the device off; the next
+ * wake is either a button press or the configured slideshow timer.
+ */
+void app_manager_request_shutdown(void);

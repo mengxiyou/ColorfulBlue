@@ -199,6 +199,40 @@ static void shutdown_after_low_power_cycle()
     }
 }
 
+void app_manager_request_shutdown(void)
+{
+    ESP_LOGI(g_tag, "Shutdown requested (front-panel C button)");
+
+    // Two short blips at the same pitch/volume as the A/B navigation feedback
+    // (MIDI 120, 80 ms each). The double tap distinguishes shutdown from a
+    // navigation press; lower-pitched melodies got drowned out by the speaker
+    // driver's per-tone fade-out at this duration.
+    //
+    // audio::play_tone_from_midi queues each buffer via M5.Speaker.playRaw
+    // (async) and returns immediately; we must keep the task alive until the
+    // speaker driver has emitted all queued samples, otherwise hal.powerOff
+    // cuts PMIC power before any sound reaches the speaker.
+    M5.Speaker.setVolume(200);
+    audio::play_tone_from_midi(120, 0.08);
+    vTaskDelay(pdMS_TO_TICKS(60));         // brief gap so it's clearly two beeps
+    audio::play_tone_from_midi(120, 0.08);
+    vTaskDelay(pdMS_TO_TICKS(300));        // let the second beep finish + fade tail
+
+    // Optionally schedule the next periodic wake; if not configured this
+    // silently no-ops and the device stays off until a button press.
+    if (!prepare_next_low_power_wake()) {
+        ESP_LOGI(g_tag, "Shutdown: no periodic wake scheduled (off until button press)");
+    }
+
+    hal.clearWakeFlags();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    hal.powerOff();
+
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
 static bool run_rtc_wake_one_shot_cycle()
 {
     if (!hal.isRtcWakeBoot() || !hal.lowPowerModeEnabled() || !hal.settings.auto_slideshow ||

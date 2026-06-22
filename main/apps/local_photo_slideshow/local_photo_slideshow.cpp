@@ -380,20 +380,33 @@ bool PhotoSlideshow::isWaitingSettle() const
 
 /* ====================== Button handling ====================== */
 void PhotoSlideshow::handleButtons()
-{  // A 523
-    bool button_a_pressed  = M5.BtnA.wasPressed();
+{
+    // A = prev, B = next, C = shutdown (sleep + optional periodic wake).
+    // A uses wasClicked() so a 5s+ long-press (handled in app_task to enable
+    // the WiFi AP) does NOT also fire prev. C also uses wasClicked() so a
+    // held-down C does not accidentally power the device off.
     bool button_a_released = M5.BtnA.wasClicked();
-    bool button_c_pressed  = M5.BtnC.wasPressed();
     bool button_b_pressed  = M5.BtnB.wasPressed();
-    if (button_c_pressed) audio::play_tone_from_midi(119, 0.08);
-    if (button_b_pressed) audio::play_tone_from_midi(120, 0.08);
-    if (button_a_pressed) audio::play_tone_from_midi(121, 0.08);
-    if (button_a_released && !_last_btn_a) toggleRotation();
-    if (button_c_pressed && !_last_btn_c) prev();
-    if (button_b_pressed && !_last_btn_b) next();
-    _last_btn_c = button_c_pressed;
-    _last_btn_b = button_b_pressed;
+    bool button_c_released = M5.BtnC.wasClicked();
+
+    if (button_a_released && !_last_btn_a) {
+        audio::play_tone_from_midi(121, 0.08);
+        prev();
+    }
+    if (button_b_pressed && !_last_btn_b) {
+        audio::play_tone_from_midi(120, 0.08);
+        next();
+    }
+    if (button_c_released && !_last_btn_c) {
+        // app_manager_request_shutdown() plays its own descending chime and
+        // never returns: it triggers PMIC powerOff (with optional RTC wake
+        // schedule if auto-slideshow is configured).
+        app_manager_request_shutdown();
+    }
+
     _last_btn_a = button_a_released;
+    _last_btn_b = button_b_pressed;
+    _last_btn_c = button_c_released;
 }
 
 /* ============== Rescan ============== */
