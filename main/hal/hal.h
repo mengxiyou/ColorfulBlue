@@ -22,32 +22,13 @@ enum SettingKey : uint8_t {
     SETTING_ROTATION,
     SETTING_AUTO_SLIDESHOW,
     SETTING_INTERVAL,
-    SETTING_CURRENT_MODE,
     SETTING_BOOT_SOUND,
     SETTING_DEVICE_NAME,
     SETTING_LOW_POWER_MODE
 };
 
-/** @brief Local slideshow mode identifier. */
-static constexpr const char* MODE_ID_LOCAL = "mode_1";
-/** @brief Ezdata mode identifier. */
-static constexpr const char* MODE_ID_EZDATA = "mode_2";
-
-/**
- * @brief Application mode values used by the HAL.
- */
-enum AppMode : uint8_t { APP_MODE_NONE = 0, APP_MODE_LOCAL, APP_MODE_EZDATA };
-
-/** @brief Normalizes a mode identifier. */
-bool normalize_mode_id(const char* input, char* output, size_t output_size);
 /** @brief Normalizes a device name. */
 bool normalize_device_name(const char* input, char* output, size_t output_size);
-/** @brief Checks whether a mode identifier is supported. */
-bool is_supported_mode_id(const char* mode_id);
-/** @brief Converts a mode identifier to AppMode. */
-AppMode app_mode_from_mode_id(const char* mode_id);
-/** @brief Converts AppMode to its mode identifier. */
-const char* mode_id_from_app_mode(AppMode mode);
 /** @brief Compares two C strings. */
 int cstring_compare(const char* lhs, const char* rhs);
 /** @brief Copies a C string into a fixed-size buffer. */
@@ -62,7 +43,6 @@ struct Settings {
     uint8_t rotation;  // 0=landscape, 1=portrait
     bool auto_slideshow;
     int interval_minutes;
-    char current_mode[16];  // "" (none, factory default) / "mode_1" (local) / "mode_2" (ezdata)
     bool boot_sound;
     char device_name[64];
     bool low_power_mode;
@@ -83,10 +63,8 @@ class Hal {
 public:
     M5PM1 pm1;
     M5Canvas* Canvas = nullptr;
-    std::string device_token;
-    bool ezdata_connected = false;
-    float temperature     = 0.0f;
-    float humidity        = 0.0f;
+    float temperature = 0.0f;
+    float humidity    = 0.0f;
 
     Settings settings;
 

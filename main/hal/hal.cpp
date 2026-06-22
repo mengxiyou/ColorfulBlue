@@ -69,23 +69,6 @@ size_t cstring_copy(char* dst, const char* src, size_t dst_size)
     return src_len;
 }
 
-bool normalize_mode_id(const char* input, char* output, size_t output_size)
-{
-    const char* normalized = "";
-    bool changed           = false;
-
-    if (input && cstring_compare(input, MODE_ID_LOCAL) == 0) {
-        normalized = MODE_ID_LOCAL;
-    } else if (input && cstring_compare(input, MODE_ID_EZDATA) == 0) {
-        normalized = MODE_ID_EZDATA;
-    } else if (input && input[0]) {
-        changed = true;
-    }
-
-    cstring_copy(output, normalized, output_size);
-    return changed;
-}
-
 bool normalize_device_name(const char* input, char* output, size_t output_size)
 {
     static constexpr const char* k_default_device_name = "papercolor";
@@ -141,23 +124,6 @@ bool normalize_device_name(const char* input, char* output, size_t output_size)
     }
 
     return changed || cstring_compare(output, input) != 0;
-}
-
-bool is_supported_mode_id(const char* mode_id)
-{
-    return mode_id && (cstring_compare(mode_id, MODE_ID_LOCAL) == 0 || cstring_compare(mode_id, MODE_ID_EZDATA) == 0);
-}
-
-AppMode app_mode_from_mode_id(const char* mode_id)
-{
-    if (!mode_id || !mode_id[0]) return APP_MODE_NONE;
-    return (cstring_compare(mode_id, MODE_ID_EZDATA) == 0) ? APP_MODE_EZDATA : APP_MODE_LOCAL;
-}
-
-const char* mode_id_from_app_mode(AppMode mode)
-{
-    if (mode == APP_MODE_NONE) return "";
-    return mode == APP_MODE_EZDATA ? MODE_ID_EZDATA : MODE_ID_LOCAL;
 }
 
 void Hal::init()
@@ -280,15 +246,11 @@ void Hal::settingsInit()
     settings.interval_minutes = 60;
     settings.boot_sound       = true;
     settings.low_power_mode   = false;
-    cstring_copy(settings.current_mode, "", sizeof(settings.current_mode));
     cstring_copy(settings.device_name, "papercolor", sizeof(settings.device_name));
 
-    bool mode_changed        = false;
     bool device_name_changed = false;
-    bool has_nvs             = false;
     nvs_handle_t nvs_handle;
     if (nvs_open("papercolor", NVS_READONLY, &nvs_handle) == ESP_OK) {
-        has_nvs = true;
         size_t value_size;
 
         value_size = sizeof(settings.wifi_ssid);
@@ -309,14 +271,6 @@ void Hal::settingsInit()
         if (nvs_get_u16(nvs_handle, "interval", &value_u16) == ESP_OK && value_u16 >= 1 && value_u16 <= 255)
             settings.interval_minutes = (int)value_u16;
 
-        value_size         = sizeof(settings.current_mode);
-        esp_err_t mode_err = nvs_get_str(nvs_handle, "cur_mode", settings.current_mode, &value_size);
-        if (mode_err == ESP_OK) {
-            char normalized_mode[sizeof(settings.current_mode)];
-            mode_changed = normalize_mode_id(settings.current_mode, normalized_mode, sizeof(normalized_mode));
-            cstring_copy(settings.current_mode, normalized_mode, sizeof(settings.current_mode));
-        }
-
         value_size = sizeof(settings.device_name);
         if (nvs_get_str(nvs_handle, "device_name", settings.device_name, &value_size) == ESP_OK) {
             char normalized_device_name[sizeof(settings.device_name)];
@@ -328,21 +282,11 @@ void Hal::settingsInit()
         nvs_close(nvs_handle);
     }
 
-    if (!has_nvs) {
-        char normalized_mode[sizeof(settings.current_mode)];
-        mode_changed = normalize_mode_id(settings.current_mode, normalized_mode, sizeof(normalized_mode));
-        cstring_copy(settings.current_mode, normalized_mode, sizeof(settings.current_mode));
-    }
-
     {
         char normalized_device_name[sizeof(settings.device_name)];
         device_name_changed =
             normalize_device_name(settings.device_name, normalized_device_name, sizeof(normalized_device_name));
         cstring_copy(settings.device_name, normalized_device_name, sizeof(settings.device_name));
-    }
-
-    if (mode_changed) {
-        settingsSave(SETTING_CURRENT_MODE);
     }
 
     if (device_name_changed) {
@@ -351,8 +295,8 @@ void Hal::settingsInit()
 
     Canvas->setRotation(settings.rotation);
 
-    ESP_LOGI(TAG, "Settings loaded: rot=%d, slide=%d, interval=%d, mode=%s, boot_sound=%d", settings.rotation,
-             settings.auto_slideshow, settings.interval_minutes, settings.current_mode, settings.boot_sound ? 1 : 0);
+    ESP_LOGI(TAG, "Settings loaded: rot=%d, slide=%d, interval=%d, boot_sound=%d", settings.rotation,
+             settings.auto_slideshow, settings.interval_minutes, settings.boot_sound ? 1 : 0);
 }
 
 void Hal::settingsSave(SettingKey key)
@@ -402,19 +346,6 @@ void Hal::settingsSave(SettingKey key)
             uint16_t v;
             if (nvs_get_u16(h, "interval", &v) != ESP_OK || v != (uint16_t)settings.interval_minutes) {
                 nvs_set_u16(h, "interval", (uint16_t)settings.interval_minutes);
-                changed = true;
-            }
-            break;
-        }
-        case SETTING_CURRENT_MODE: {
-            char normalized_mode[sizeof(settings.current_mode)];
-            normalize_mode_id(settings.current_mode, normalized_mode, sizeof(normalized_mode));
-            cstring_copy(settings.current_mode, normalized_mode, sizeof(settings.current_mode));
-
-            char prev[16] = {};
-            size_t sz     = sizeof(prev);
-            if (nvs_get_str(h, "cur_mode", prev, &sz) != ESP_OK || cstring_compare(prev, settings.current_mode) != 0) {
-                nvs_set_str(h, "cur_mode", settings.current_mode);
                 changed = true;
             }
             break;

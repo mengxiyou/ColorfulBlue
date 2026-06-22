@@ -27,12 +27,10 @@
 #include "hal/wifi/hal_wifi.h"
 #include "hal/storage/hal_storage.h"
 #include "apps/local_photo_slideshow/local_photo_slideshow.h"
-#include "apps/ezdata_photo_push/ezdata_photo_push.h"
 #include "hal/utils/dns_server/dns_server.h"
 #include "hal/hal.h"
 #include "mdns.h"
 #include "apps/app_manager/app_manager.h"
-#include "hal/ezdata/hal_ezdata.h"
 
 using namespace hal_wifi;
 
@@ -70,14 +68,6 @@ typedef struct {
 } photo_entry_t;
 
 static device_state_t g_dev_state = {0};
-
-static const struct {
-    const char *id;
-    const char *name;
-} k_supported_modes[] = {
-    {MODE_ID_LOCAL, "AP"},
-    {MODE_ID_EZDATA, "INTERNET"},
-};
 
 static const char *get_mime(const char *path)
 {
@@ -301,13 +291,8 @@ static esp_err_t generate_next_photo_name(const char *ext, const char *algorithm
 /* ==== WiFi (via hal_wifi library) ==== */
 static int perform_wifi_scan(void)
 {
-    // Pause auto-reconnect to avoid scan contention causing esp_wifi_scan_start to fail
-    app_manager_pause_wifi_reconnect();
-
     std::vector<hal_wifi::WiFiScanResult> results;
     esp_err_t err = WiFi.scanNetworks(results, false, SCAN_TIMEOUT_MS);
-
-    app_manager_resume_wifi_reconnect();
 
     if (err != ESP_OK) {
         return -1;
@@ -331,40 +316,14 @@ static int perform_wifi_scan(void)
     return cnt;
 }
 
-static void app_server_set_requested_mode(const char *mode_id)
+static void app_server_set_connecting_state(void)
 {
-    if (mode_id && mode_id[0]) {
-        strlcpy(g_dev_state.requested_mode, mode_id, sizeof(g_dev_state.requested_mode));
-    } else {
-        g_dev_state.requested_mode[0] = 0;
-    }
-}
-
-static void app_server_set_connecting_state(const char *mode_id)
-{
-    if (mode_id && mode_id[0]) {
-        strlcpy(g_dev_state.requested_mode, mode_id, sizeof(g_dev_state.requested_mode));
-    }
     strlcpy(g_dev_state.conn_err, "connecting", sizeof(g_dev_state.conn_err));
 }
 
 static void app_server_clear_connecting_state(void)
 {
     g_dev_state.conn_err[0] = 0;
-}
-
-static void app_server_set_mode_state(const char *mode_id)
-{
-    strlcpy(g_dev_state.current_mode, mode_id, sizeof(g_dev_state.current_mode));
-    if (mode_id && mode_id[0]) {
-        strlcpy(g_dev_state.requested_mode, mode_id, sizeof(g_dev_state.requested_mode));
-    }
-    g_dev_state.conn_err[0] = 0;
-}
-
-static void app_server_set_mode_pending_state(const char *mode_id)
-{
-    app_server_set_requested_mode(mode_id);
 }
 
 static void app_server_set_connect_failed_state(const char *message)
@@ -374,14 +333,10 @@ static void app_server_set_connect_failed_state(const char *message)
 
 static int perform_wifi_connect(const char *ssid, const char *pass)
 {
-    // Pause auto-reconnect to avoid connection contention
-    app_manager_pause_wifi_reconnect();
     WiFi.disconnect();
     vTaskDelay(pdMS_TO_TICKS(200));
 
     esp_err_t err = WiFi.connect(ssid, pass ? pass : "", CONNECT_TIMEOUT_MS);
-
-    app_manager_resume_wifi_reconnect();
 
     if (err == ESP_OK) {
         app_server_clear_connecting_state();
@@ -397,23 +352,6 @@ static int perform_wifi_connect(const char *ssid, const char *pass)
 }
 
 /* ==== Route handlers ==== */
-static esp_err_t h_get_modes(httpd_req_t *req)
-{
-    cJSON *r = cJSON_CreateObject();
-    cJSON *a = cJSON_AddArrayToObject(r, "modes");
-
-    for (size_t i = 0; i < sizeof(k_supported_modes) / sizeof(k_supported_modes[0]); ++i) {
-        cJSON *m = cJSON_CreateObject();
-        cJSON_AddStringToObject(m, "id", k_supported_modes[i].id);
-        cJSON_AddStringToObject(m, "name", k_supported_modes[i].name);
-        cJSON_AddItemToArray(a, m);
-    }
-
-    send_json_response(req, r);
-    cJSON_Delete(r);
-    return ESP_OK;
-}
-
 static esp_err_t h_wifi_scan(httpd_req_t *req)
 {
     perform_wifi_scan();
@@ -449,7 +387,6 @@ static esp_err_t h_wifi_config(httpd_req_t *req)
 
     cJSON *ssid_j        = cJSON_GetObjectItem(j, "ssid");
     cJSON *pass_j        = cJSON_GetObjectItem(j, "password");
-    cJSON *mode_j        = cJSON_GetObjectItem(j, "mode");
     cJSON *boot_sound_j  = cJSON_GetObjectItem(j, "boot_sound");
     cJSON *device_name_j = cJSON_GetObjectItem(j, "device_name");
 
@@ -458,15 +395,13 @@ static esp_err_t h_wifi_config(httpd_req_t *req)
     const bool has_device_name = cJSON_IsString(device_name_j) && device_name_j->valuestring;
     const bool boot_sound      = has_boot_sound && cJSON_IsTrue(boot_sound_j);
 
-    if (!has_ssid && !has_boot_sound && !has_device_name &&
-        !(cJSON_IsString(mode_j) && mode_j->valuestring && mode_j->valuestring[0])) {
+    if (!has_ssid && !has_boot_sound && !has_device_name) {
         cJSON_Delete(j);
         return send_error_response(req, 400, "ssid required");
     }
 
     char ssid_buf[64]        = {0};
     char pass_buf[64]        = {0};
-    char mode_buf[32]        = {0};
     char device_name_buf[64] = {0};
 
     if (has_ssid) {
@@ -475,17 +410,10 @@ static esp_err_t h_wifi_config(httpd_req_t *req)
     if (cJSON_IsString(pass_j) && pass_j->valuestring) {
         strlcpy(pass_buf, pass_j->valuestring, sizeof(pass_buf));
     }
-    if (cJSON_IsString(mode_j) && mode_j->valuestring && mode_j->valuestring[0]) {
-        strlcpy(mode_buf, mode_j->valuestring, sizeof(mode_buf));
-    }
     if (has_device_name) {
         normalize_device_name(device_name_j->valuestring, device_name_buf, sizeof(device_name_buf));
     }
     cJSON_Delete(j);
-
-    if (mode_buf[0]) {
-        app_server_set_mode_pending_state(mode_buf);
-    }
 
     if (has_ssid) {
         char connect_pass[sizeof(hal.settings.wifi_password)] = {0};
@@ -516,21 +444,13 @@ static esp_err_t h_wifi_config(httpd_req_t *req)
         }
 
         if (!skip_connect) {
-            app_server_set_connecting_state(mode_buf[0] ? mode_buf : nullptr);
+            app_server_set_connecting_state();
             if (perform_wifi_connect(ssid_buf, connect_pass) != 0) {
                 return send_error_response(req, 500, "wifi connect failed");
             }
         } else {
             app_server_clear_connecting_state();
         }
-    }
-
-    if (mode_buf[0]) {
-        esp_err_t mode_err = app_manager_apply_mode(mode_buf);
-        if (mode_err != ESP_OK) {
-            return send_error_response(req, 500, "mode switch failed");
-        }
-        app_server_set_mode_state(mode_buf);
     }
 
     if (has_boot_sound || has_device_name) {
@@ -572,27 +492,21 @@ static esp_err_t h_wifi_config(httpd_req_t *req)
 
 static esp_err_t h_wifi_status(httpd_req_t *req)
 {
-    cJSON *r                                                = cJSON_CreateObject();
-    std::string ssid                                        = WiFi.SSID();
-    bool boot_sound                                         = false;
-    char device_name[sizeof(hal.settings.device_name)]      = {0};
-    char current_mode[sizeof(g_dev_state.current_mode)]     = {0};
-    char requested_mode[sizeof(g_dev_state.requested_mode)] = {0};
-    char conn_err[sizeof(g_dev_state.conn_err)]             = {0};
-    bool connected                                          = WiFi.isConnected();
+    cJSON *r                                           = cJSON_CreateObject();
+    std::string ssid                                   = WiFi.SSID();
+    bool boot_sound                                    = false;
+    char device_name[sizeof(hal.settings.device_name)] = {0};
+    char conn_err[sizeof(g_dev_state.conn_err)]        = {0};
+    bool connected                                     = WiFi.isConnected();
 
     hal.settingsLock();
     boot_sound = hal.settings.boot_sound;
     cstring_copy(device_name, hal.settings.device_name, sizeof(device_name));
     hal.settingsUnlock();
 
-    strlcpy(current_mode, g_dev_state.current_mode, sizeof(current_mode));
-    strlcpy(requested_mode, g_dev_state.requested_mode, sizeof(requested_mode));
     strlcpy(conn_err, g_dev_state.conn_err, sizeof(conn_err));
 
     cJSON_AddBoolToObject(r, "connected", connected);
-    cJSON_AddStringToObject(r, "mode", current_mode);
-    cJSON_AddStringToObject(r, "requested_mode", requested_mode);
     cJSON_AddStringToObject(r, "ssid", ssid.c_str());
     cJSON_AddStringToObject(r, "error", conn_err[0] ? conn_err : NULL);
 
@@ -611,23 +525,13 @@ static esp_err_t h_device_ready(httpd_req_t *req)
 {
     cJSON *r    = cJSON_CreateObject();
     cJSON *wifi = cJSON_AddObjectToObject(r, "wifi");
-    cJSON *mode = cJSON_AddObjectToObject(r, "mode");
-    cJSON *ui   = cJSON_AddObjectToObject(r, "ui");
 
-    bool connected                                          = WiFi.isConnected();
-    std::string ssid                                        = WiFi.SSID();
-    std::string ip                                          = connected ? WiFi.localIP() : std::string();
-    char current_mode[sizeof(g_dev_state.current_mode)]     = {0};
-    char requested_mode[sizeof(g_dev_state.requested_mode)] = {0};
-    char conn_err[sizeof(g_dev_state.conn_err)]             = {0};
+    bool connected                              = WiFi.isConnected();
+    std::string ssid                            = WiFi.SSID();
+    std::string ip                              = connected ? WiFi.localIP() : std::string();
+    char conn_err[sizeof(g_dev_state.conn_err)] = {0};
 
-    strlcpy(current_mode, g_dev_state.current_mode, sizeof(current_mode));
-    strlcpy(requested_mode, g_dev_state.requested_mode, sizeof(requested_mode));
     strlcpy(conn_err, g_dev_state.conn_err, sizeof(conn_err));
-
-    const bool mode_ready     = requested_mode[0] && strcmp(current_mode, requested_mode) == 0;
-    const bool is_local_mode  = strcmp(current_mode, MODE_ID_LOCAL) == 0;
-    const bool can_enter_mode = mode_ready && (is_local_mode || connected);
 
     const char *wifi_state = "disconnected";
     if (conn_err[0]) {
@@ -640,10 +544,6 @@ static esp_err_t h_device_ready(httpd_req_t *req)
     cJSON_AddStringToObject(wifi, "ssid", ssid.c_str());
     cJSON_AddStringToObject(wifi, "ip", connected ? ip.c_str() : "");
     cJSON_AddStringToObject(wifi, "error", (conn_err[0] && strcmp(conn_err, "connecting") != 0) ? conn_err : NULL);
-    cJSON_AddStringToObject(mode, "requested", requested_mode);
-    cJSON_AddStringToObject(mode, "current", current_mode);
-    cJSON_AddBoolToObject(mode, "ready", mode_ready);
-    cJSON_AddBoolToObject(ui, "can_enter_mode", can_enter_mode);
 
     send_json_response(req, r);
     cJSON_Delete(r);
@@ -653,10 +553,8 @@ static esp_err_t h_device_ready(httpd_req_t *req)
 static esp_err_t h_wifi_disconnect(httpd_req_t *req)
 {
     app_manager_disconnect_sta_keep_ap();
-    g_dev_state.current_mode[0]   = 0;
-    g_dev_state.requested_mode[0] = 0;
-    g_dev_state.conn_err[0]       = 0;
-    cJSON *r                      = cJSON_CreateObject();
+    g_dev_state.conn_err[0] = 0;
+    cJSON *r                = cJSON_CreateObject();
     cJSON_AddStringToObject(r, "status", "disconnected");
     send_json_response(req, r);
     cJSON_Delete(r);
@@ -1132,65 +1030,6 @@ static esp_err_t h_mode_cfg_set(httpd_req_t *req)
     return ESP_OK;
 }
 
-static esp_err_t h_mode2_cfg_get(httpd_req_t *req)
-{
-    cJSON *r = cJSON_CreateObject();
-    cJSON_AddStringToObject(r, "orientation", hal.settings.rotation == 0 ? "landscape" : "portrait");
-    cJSON_AddBoolToObject(r, "auto_slideshow", hal.settings.auto_slideshow);
-    cJSON_AddNumberToObject(r, "interval_minutes", hal.settings.interval_minutes);
-    cJSON_AddBoolToObject(r, "low_power_mode", hal.settings.low_power_mode);
-
-    // EzData connection status
-    cJSON_AddBoolToObject(r, "connected", ezdata_is_connected());
-    cJSON_AddStringToObject(r, "device_token", hal.device_token.c_str());
-
-    send_json_response(req, r);
-    cJSON_Delete(r);
-    return ESP_OK;
-}
-
-static esp_err_t h_mode_switch(httpd_req_t *req)
-{
-    char buf[256];
-    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
-    if (len <= 0) {
-        return send_error_response(req, 400, "no body");
-    }
-    buf[len] = 0;
-    cJSON *j = cJSON_Parse(buf);
-    if (!j) {
-        return send_error_response(req, 400, "bad json");
-    }
-    cJSON *mode_item = cJSON_GetObjectItem(j, "mode");
-    if (!cJSON_IsString(mode_item)) {
-        cJSON_Delete(j);
-        return send_error_response(req, 400, "mode required");
-    }
-
-    char normalized_mode[16] = {0};
-    normalize_mode_id(mode_item->valuestring, normalized_mode, sizeof(normalized_mode));
-    if (!is_supported_mode_id(normalized_mode) || strcmp(mode_item->valuestring, normalized_mode) != 0) {
-        cJSON_Delete(j);
-        return send_error_response(req, 400, "invalid mode");
-    }
-
-    esp_err_t err = app_manager_apply_mode(normalized_mode);
-    if (err != ESP_OK) {
-        cJSON_Delete(j);
-        return send_error_response(req, 500, "mode switch failed");
-    }
-
-    app_server_set_mode_state(normalized_mode);
-
-    cJSON *r = cJSON_CreateObject();
-    cJSON_AddStringToObject(r, "status", "ok");
-    cJSON_AddStringToObject(r, "mode", normalized_mode);
-    send_json_response(req, r);
-    cJSON_Delete(r);
-    cJSON_Delete(j);
-    return ESP_OK;
-}
-
 static esp_err_t h_data_serve(httpd_req_t *req)
 {
     const char *fp = req->uri + 6; /* Skip "/data/" */
@@ -1359,7 +1198,6 @@ esp_err_t http_404_error_handler(httpd_req_t *req, httpd_err_code_t err)
 
 /* ==== Route table ==== */
 static const httpd_uri_t routes[] = {
-    {"/api/modes", HTTP_GET, h_get_modes},
     {"/api/wifi/scan", HTTP_GET, h_wifi_scan},
     {"/api/wifi/config", HTTP_POST, h_wifi_config},
     {"/api/wifi/status", HTTP_GET, h_wifi_status},
@@ -1372,9 +1210,6 @@ static const httpd_uri_t routes[] = {
     {"/api/battery", HTTP_GET, h_battery},
     {"/api/mode/mode_1/config", HTTP_GET, h_mode_cfg_get},
     {"/api/mode/mode_1/config", HTTP_POST, h_mode_cfg_set},
-    {"/api/mode/mode_2/config", HTTP_GET, h_mode2_cfg_get},
-    {"/api/mode/mode_2/config", HTTP_POST, h_mode_cfg_set},
-    {"/api/mode/switch", HTTP_POST, h_mode_switch},
     {"/data/*", HTTP_GET, h_data_serve},
     {"/api/photos/display", HTTP_POST, h_photos_display},
     {"/api/system/reset", HTTP_POST, h_system_reset},
@@ -1384,12 +1219,6 @@ static const httpd_uri_t routes[] = {
 
 esp_err_t app_server_init(void)
 {
-    // Initialize device state from persisted settings
-    strlcpy(g_dev_state.current_mode, hal.settings.current_mode, sizeof(g_dev_state.current_mode));
-    if (hal.settings.current_mode[0]) {
-        strlcpy(g_dev_state.requested_mode, hal.settings.current_mode, sizeof(g_dev_state.requested_mode));
-    }
-
     /* WiFi events — additional listener, does not own the WiFi lifecycle. */
     WiFi.onEvent([](WiFiEvent ev, void *data) {
         switch (ev) {
@@ -1487,16 +1316,6 @@ esp_err_t app_server_stop(void)
     return ESP_OK;
 }
 
-void app_server_sync_mode(const char *mode_id)
-{
-    strlcpy(g_dev_state.current_mode, mode_id, sizeof(g_dev_state.current_mode));
-    if (mode_id && mode_id[0]) {
-        strlcpy(g_dev_state.requested_mode, mode_id, sizeof(g_dev_state.requested_mode));
-    } else {
-        g_dev_state.requested_mode[0] = 0;
-    }
-}
-
 device_state_t app_server_get_state(void)
 {
     device_state_t s = {};
@@ -1505,8 +1324,6 @@ device_state_t app_server_get_state(void)
         std::string ip = WiFi.localIP();
         strlcpy(s.ip_address, ip.c_str(), sizeof(s.ip_address));
     }
-    strlcpy(s.current_mode, g_dev_state.current_mode, sizeof(s.current_mode));
-    strlcpy(s.requested_mode, g_dev_state.requested_mode, sizeof(s.requested_mode));
     strlcpy(s.current_image, g_dev_state.current_image, sizeof(s.current_image));
     strlcpy(s.connected_ssid, WiFi.SSID().c_str(), sizeof(s.connected_ssid));
     strlcpy(s.conn_err, g_dev_state.conn_err, sizeof(s.conn_err));

@@ -43,38 +43,6 @@ void app_manager_factory_reset_machine(void);
 esp_err_t app_manager_start(void);
 
 /**
- * @brief Applies the requested mode through the mode switch workflow.
- *
- * @param mode_id Mode identifier to apply.
- *
- * @return
- *      - ESP_OK on success
- *      - An ESP error code if the mode cannot be applied
- */
-esp_err_t app_manager_apply_mode(const char* mode_id);
-
-/**
- * @brief Updates the current mode record without running the full switch flow.
- *
- * @param mode_id Mode identifier to store.
- *
- * @return
- *      - ESP_OK on success
- *      - An ESP error code if the mode cannot be stored
- */
-esp_err_t app_manager_set_current_mode(const char* mode_id);
-
-/**
- * @brief Pauses automatic Wi-Fi reconnect attempts.
- */
-void app_manager_pause_wifi_reconnect(void);
-
-/**
- * @brief Resumes automatic Wi-Fi reconnect attempts.
- */
-void app_manager_resume_wifi_reconnect(void);
-
-/**
  * @brief Disconnects the STA interface while keeping the AP enabled.
  *
  * @return

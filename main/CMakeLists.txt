@@ -6,11 +6,9 @@ idf_component_register(
         "apps/app_manager/app_manager.cpp"
         "apps/app_server/app_server.cpp"
         "hal/storage/hal_storage.cpp"
-        "hal/ezdata/hal_ezdata.cpp"
         "hal/wifi/hal_wifi.cpp"
         "hal/hal.cpp"
         "apps/local_photo_slideshow/local_photo_slideshow.cpp"
-        "apps/ezdata_photo_push/ezdata_photo_push.cpp"
         "hal/utils/image/image_utils.cpp"
         "hal/utils/audio/audio.cpp"
         "hal/utils/dns_server/dns_server.c"
@@ -32,10 +30,6 @@ idf_component_register(
         M5Unified
         M5GFX
         tinyusb
-        esp_http_client
-        esp-tls
-        json
-        mqtt
 
 )
 
