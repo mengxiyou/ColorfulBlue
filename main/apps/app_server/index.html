@@ -2383,6 +2383,14 @@ let _v2pal_luma = null;
 // 0 = old behaviour. Larger = smoother dither patterns at the cost of slight
 // colour drift. 0.15 is gentle: only breaks ties when colours are similar.
 const LUMA_NEIGHBOUR_WEIGHT = 0.15;
+// Anti-run penalty: a tiny constant added to the score when a candidate
+// matches the just-placed ink, so runs of identical ink in a row are
+// gently discouraged. 0.003 is small enough that a true colour match
+// (colorDist² ≈ 0, e.g. white in a pure white region) still wins; in a
+// flat region where error accumulates, the penalty nudges the kernel
+// to switch to its second-best candidate slightly earlier, breaking up
+// "lines of the same dither dot" without dirtying clean areas.
+const SAME_INK_PENALTY = 0.003;
 function _v2ensure() {
   if (_v2lut) return;
   _v2lut = new Float32Array(256);
@@ -2545,6 +2553,7 @@ function quantizeToEpdPaletteV2(imageData) {
   const pal = _v2pal, ink = EPD_PALETTE_PANEL, L = _v2lut, palLuma = _v2pal_luma;
   const picks = pickColors, pRange = pickRange, pStr = pickStrength, nPicks = picks.length;
   const lumaW = LUMA_NEIGHBOUR_WEIGHT;
+  const repeatPenalty = SAME_INK_PENALTY;
   let cur = new Float32Array(w * 3);
   let nxt = new Float32Array(w * 3);
   for (let y = 0; y < h; y++) {
@@ -2552,14 +2561,16 @@ function quantizeToEpdPaletteV2(imageData) {
     const l2r = (y & 1) === 0;
     const xs = l2r ? 0 : w - 1, xe = l2r ? w : -1, fwd = l2r ? 1 : -1;
     let prevLuma = -1;  // reset per row: no neighbour at row start
+    let prevBest = -1;  // reset per row: no previous ink to repeat from
     for (let x = xs; x !== xe; x += fwd) {
       const idx = (y * w + x) * 4, xi = x * 3;
       let wr = L[data[idx]] + cur[xi], wg = L[data[idx + 1]] + cur[xi + 1], wb = L[data[idx + 2]] + cur[xi + 2];
       wr = wr < 0 ? 0 : (wr > 1 ? 1 : wr);
       wg = wg < 0 ? 0 : (wg > 1 ? 1 : wg);
       wb = wb < 0 ? 0 : (wb > 1 ? 1 : wb);
-      // Nearest-ink, biased by luminance closeness to the previously-placed
-      // pixel in this row. See LUMA_NEIGHBOUR_WEIGHT for tuning notes.
+      // Nearest-ink, biased by (a) luminance closeness to the just-placed
+      // neighbour and (b) a tiny penalty against picking the same ink twice
+      // in a row. See LUMA_NEIGHBOUR_WEIGHT / SAME_INK_PENALTY for tuning.
       let best = 0, bd = 1e30;
       for (let p = 0; p < 6; p++) {
         const dr = wr - pal[p][0], dg = wg - pal[p][1], db = wb - pal[p][2];
@@ -2568,9 +2579,11 @@ function quantizeToEpdPaletteV2(imageData) {
           const ld = palLuma[p] - prevLuma;
           s += lumaW * ld * ld;
         }
+        if (p === prevBest) s += repeatPenalty;
         if (s < bd) { bd = s; best = p; }
       }
       prevLuma = palLuma[best];
+      prevBest = best;
       const rr = wr - pal[best][0], rg = wg - pal[best][1], rb = wb - pal[best][2];
       let f = 1;
       if (nPicks > 0 && pStr > 0) {
@@ -2750,6 +2763,7 @@ function quantizeToEpdPaletteAtkinson(imageData) {
   const pal = _v2pal, ink = EPD_PALETTE_PANEL, L = _v2lut, palLuma = _v2pal_luma;
   const picks = pickColors, pRange = pickRange, pStr = pickStrength, nPicks = picks.length;
   const lumaW = LUMA_NEIGHBOUR_WEIGHT;
+  const repeatPenalty = SAME_INK_PENALTY;
   let cur  = new Float32Array(w * 3);
   let nxt  = new Float32Array(w * 3);
   let nxt2 = new Float32Array(w * 3);
@@ -2758,6 +2772,7 @@ function quantizeToEpdPaletteAtkinson(imageData) {
     const l2r = (y & 1) === 0;
     const xs = l2r ? 0 : w - 1, xe = l2r ? w : -1, fwd = l2r ? 1 : -1;
     let prevLuma = -1;  // reset per row: no neighbour at row start
+    let prevBest = -1;  // reset per row: no previous ink to repeat from
     for (let x = xs; x !== xe; x += fwd) {
       const idx = (y * w + x) * 4, xi = x * 3;
       let wr = L[data[idx]]     + cur[xi];
@@ -2766,8 +2781,9 @@ function quantizeToEpdPaletteAtkinson(imageData) {
       wr = wr < 0 ? 0 : (wr > 1 ? 1 : wr);
       wg = wg < 0 ? 0 : (wg > 1 ? 1 : wg);
       wb = wb < 0 ? 0 : (wb > 1 ? 1 : wb);
-      // Nearest-ink, biased by luminance closeness to the previously-placed
-      // pixel in this row. See LUMA_NEIGHBOUR_WEIGHT for tuning notes.
+      // Nearest-ink, biased by (a) luminance closeness to the just-placed
+      // neighbour and (b) a tiny penalty against picking the same ink twice
+      // in a row. See LUMA_NEIGHBOUR_WEIGHT / SAME_INK_PENALTY for tuning.
       let best = 0, bd = 1e30;
       for (let p = 0; p < 6; p++) {
         const dr = wr - pal[p][0], dg = wg - pal[p][1], db = wb - pal[p][2];
@@ -2776,9 +2792,11 @@ function quantizeToEpdPaletteAtkinson(imageData) {
           const ld = palLuma[p] - prevLuma;
           s += lumaW * ld * ld;
         }
+        if (p === prevBest) s += repeatPenalty;
         if (s < bd) { bd = s; best = p; }
       }
       prevLuma = palLuma[best];
+      prevBest = best;
       const rr = wr - pal[best][0], rg = wg - pal[best][1], rb = wb - pal[best][2];
       let f = 1;
       if (nPicks > 0 && pStr > 0) {
