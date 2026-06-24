@@ -477,40 +477,42 @@ void PhotoSlideshow::displayPhoto(uint16_t index)
 
     const char *fname = strrchr(path, '/');
     fname             = fname ? fname + 1 : path;
-    bool use_fastest  = (strncmp(fname, "imageN", 6) == 0);
-    if (use_fastest) {
-        M5.Display.setEpdMode(epd_mode_t::epd_fastest);
-    }
+    // imageA* (web "sharp" Atkinson) and imageS* (web "smooth" Floyd-Steinberg) are
+    // already quantized to the 6 inks -> push as-is via epd_fastest. Everything else
+    // gets M5GFX dithering.
+    bool use_fastest = (strncmp(fname, "imageA", 6) == 0) || (strncmp(fname, "imageS", 6) == 0);
 
     const char *dot = strrchr(path, '.');
+    bool drawn      = false;
     if (dot) {
         if (strcasecmp(dot, ".jpg") == 0 || strcasecmp(dot, ".jpeg") == 0) {
             hal.Canvas->drawJpgFile(path, draw_x, draw_y, 0, 0, 0, 0, scale, scale);
-            hal.statusEventSend(OPERATION_EVENT_REFRESH_START);
-            app_manager_set_refresh_in_progress(true);
-            hal.Canvas->pushSprite(0, 0);
-            app_manager_set_refresh_in_progress(false);
-            hal.statusEventSend(OPERATION_EVENT_REFRESH_COMPLETE);
+            drawn = true;
         } else if (strcasecmp(dot, ".bmp") == 0) {
             hal.Canvas->drawBmpFile(path, draw_x, draw_y, 0, 0, 0, 0, scale, scale);
-            hal.statusEventSend(OPERATION_EVENT_REFRESH_START);
-            app_manager_set_refresh_in_progress(true);
-            hal.Canvas->pushSprite(0, 0);
-            app_manager_set_refresh_in_progress(false);
-            hal.statusEventSend(OPERATION_EVENT_REFRESH_COMPLETE);
+            drawn = true;
         } else if (strcasecmp(dot, ".png") == 0) {
             hal.Canvas->drawPngFile(path, draw_x, draw_y, 0, 0, 0, 0, scale, scale);
-            hal.statusEventSend(OPERATION_EVENT_REFRESH_START);
-            app_manager_set_refresh_in_progress(true);
-            hal.Canvas->pushSprite(0, 0);
-            app_manager_set_refresh_in_progress(false);
-            hal.statusEventSend(OPERATION_EVENT_REFRESH_COMPLETE);
+            drawn = true;
         }
     }
 
-    if (use_fastest) {
-        M5.Display.setEpdMode(epd_mode_t::epd_quality);
+    if (drawn) {
+        // Pre-quantized images (imageA*/imageS*) push as-is in epd_fastest; normal
+        // photos use the panel's default epd_quality (M5GFX native dithering).
+        if (use_fastest) {
+            M5.Display.setEpdMode(epd_mode_t::epd_fastest);
+        }
+        hal.statusEventSend(OPERATION_EVENT_REFRESH_START);
+        app_manager_set_refresh_in_progress(true);
+        hal.Canvas->pushSprite(0, 0);
+        app_manager_set_refresh_in_progress(false);
+        hal.statusEventSend(OPERATION_EVENT_REFRESH_COMPLETE);
+        if (use_fastest) {
+            M5.Display.setEpdMode(epd_mode_t::epd_quality);
+        }
     }
+
     hal_storage_unlock();
 }
 

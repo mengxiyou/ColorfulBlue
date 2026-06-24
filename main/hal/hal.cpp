@@ -139,6 +139,7 @@ void Hal::init()
     M5.Display.setEpdMode(epd_mode_t::epd_quality);
     M5.Display.setRotation(3);
     Canvas = new M5Canvas(&M5.Display);
+    Canvas->setColorDepth(24);  // 24bpp bgr888: exact 8-bit channels for selective-snap dithering
     Canvas->createSprite(M5.Display.width(), M5.Display.height());
     M5.Speaker.begin();
     s_spi_bus_inited = true;

@@ -264,7 +264,20 @@ static esp_err_t send_file_response(httpd_req_t *req, const char *path)
 /* ==== Image naming (image001.jpg … image999.jpg) ==== */
 static esp_err_t generate_next_photo_name(const char *ext, const char *algorithm, char *out, size_t sz)
 {
-    char prefix     = (algorithm && strcmp(algorithm, "nearest") == 0) ? 'N' : 'd';
+    char prefix = 'd';
+    if (algorithm) {
+        // "smart" and "mix" are the current browser-side quantising modes
+        // (kernel choice and palette built client-side; firmware just pushes
+        // via epd_fastest). "smooth" and "sharp" are legacy strings kept for
+        // backward compatibility with older cached HTML.
+        if (strcmp(algorithm, "smart") == 0 ||
+            strcmp(algorithm, "mix")   == 0 ||
+            strcmp(algorithm, "smooth") == 0) {
+            prefix = 'S';
+        } else if (strcmp(algorithm, "sharp") == 0) {
+            prefix = 'A';
+        }
+    }
     bool used[1000] = {0};
     DIR *d          = opendir(BASE_PATH);
     if (d) {

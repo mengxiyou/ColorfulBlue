@@ -10,6 +10,7 @@ idf_component_register(
         "hal/hal.cpp"
         "apps/local_photo_slideshow/local_photo_slideshow.cpp"
         "hal/utils/image/image_utils.cpp"
+        "hal/utils/image/epd_dither.cpp"
         "hal/utils/audio/audio.cpp"
         "hal/utils/dns_server/dns_server.c"
     INCLUDE_DIRS
@@ -33,6 +34,7 @@ idf_component_register(
 )
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE APP_ASSETS_USE_EMBEDDED=${APP_ASSETS_USE_EMBEDDED})
+
 target_add_binary_data(${COMPONENT_LIB} "apps/app_server/index.html" TEXT)
 target_add_binary_data(${COMPONENT_LIB} "assets/PaperColor.png" BINARY)
 target_add_binary_data(${COMPONENT_LIB} "assets/arrowClickToPowerOn.png" BINARY)
