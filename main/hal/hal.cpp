@@ -566,6 +566,20 @@ bool Hal::statusEventSend(EventBits_t event_bits)
     return true;
 }
 
+void Hal::ledStatusSuspend()
+{
+    if (_led_status_indicate_task_handle) {
+        vTaskSuspend(_led_status_indicate_task_handle);
+    }
+}
+
+void Hal::ledStatusResume()
+{
+    if (_led_status_indicate_task_handle) {
+        vTaskResume(_led_status_indicate_task_handle);
+    }
+}
+
 void Hal::LedStatusIndicateTask(void* task_parameters)
 {
     Hal* instance = static_cast<Hal*>(task_parameters);

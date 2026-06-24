@@ -20,6 +20,7 @@
 #include "qrcode.h"
 #include "hal/utils/image/image_utils.h"
 #include "hal/storage/hal_storage.h"
+#include "driver/usb_serial_jtag.h"
 
 #ifndef APP_ASSETS_USE_EMBEDDED
 #define APP_ASSETS_USE_EMBEDDED 0
@@ -183,8 +184,22 @@ static bool should_idle_power_off_in_low_power_mode()
     return now - g_low_power_last_activity_ms >= LOW_POWER_IDLE_SHUTDOWN_MS;
 }
 
+// Front-line guard for every shutdown path: while USB is plugged in (host
+// is enumerating us, or sourcing VBUS through the USB-Serial/JTAG link),
+// keep the device awake so a developer can flash / inspect logs without
+// having to wake it first.
+static bool usb_link_active(void)
+{
+    return usb_serial_jtag_is_connected();
+}
+
 static void shutdown_after_low_power_cycle()
 {
+    if (usb_link_active()) {
+        ESP_LOGI(g_tag, "Low-power shutdown skipped because USB is connected");
+        app_manager_mark_activity();
+        return;
+    }
     if (!prepare_next_low_power_wake()) {
         ESP_LOGW(g_tag, "Low-power shutdown skipped because wake scheduling failed");
         return;
@@ -202,6 +217,16 @@ static void shutdown_after_low_power_cycle()
 void app_manager_request_shutdown(void)
 {
     ESP_LOGI(g_tag, "Shutdown requested (front-panel C button)");
+
+    if (usb_link_active()) {
+        // Tell the user the press registered but the device is staying on.
+        // Single longer beep, distinct from the double-tap shutdown chime.
+        ESP_LOGW(g_tag, "Shutdown ignored: USB is connected, staying awake");
+        M5.Speaker.setVolume(200);
+        audio::play_tone_from_midi(108, 0.25);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        return;
+    }
 
     // Two short blips at the same pitch/volume as the A/B navigation feedback
     // (MIDI 120, 80 ms each). The double tap distinguishes shutdown from a
@@ -573,16 +598,17 @@ esp_err_t app_manager_start()
     ESP_ERROR_CHECK(WiFi.begin());
     ESP_ERROR_CHECK(ensure_apsta_started());
 
-    // First-time setup hint: if no WiFi STA is configured yet, paint the SSID
-    // QR code on the e-paper so the user can join the device AP from a phone.
-    if (!hal.settings.wifi_ssid[0]) {
-        char ap_name[32];
-        get_ap_name(ap_name, sizeof(ap_name));
-        show_wifi_config_qrcode(ap_name);
-    }
+    // AP-idle indicator: take the LED away from the status-event task and pin
+    // it solid green. The user explicitly wants no e-paper refresh on boot
+    // (no QR code, no slideshow), so the green LED is the only sign that the
+    // device is up and the SoftAP is reachable.
+    hal.ledStatusSuspend();
+    M5.Led.setBrightness(60);
+    M5.Led.setAllColor(0, 255, 0);
+    M5.Led.display();
 
     photo_slideshow.start();
-    ESP_LOGI(g_tag, "Slideshow started");
+    ESP_LOGI(g_tag, "Slideshow ready (no boot refresh; LED green = AP idle)");
 
     xTaskCreate(app_task, "app_mgr", 10240, NULL, 5, NULL);
     return ESP_OK;
