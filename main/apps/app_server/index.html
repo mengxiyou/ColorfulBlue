@@ -2936,7 +2936,6 @@ function showPreview(src) {
   if (!container) return;
   let touchStart = null;
   let lastDist = 0;
-  let lastAngle = 0;
   let dragging = false;
   let gestureLayerId = null;
 
@@ -2961,7 +2960,6 @@ function showPreview(src) {
       gestureLayerId = selectedLayer.id;
       dragging = false;
       lastDist = getTouchDist(e.touches);
-      lastAngle = getTouchAngle(e.touches);
     }
   }, { passive: true });
 
@@ -2970,15 +2968,17 @@ function showPreview(src) {
     if (!layer) return;
     if (e.touches.length === 2) {
       e.preventDefault();
+      // Pinch zoom only. The two-finger twist that used to drive
+      // layer.transform.rotation is intentionally dropped -- a small
+      // unintended hand twist while zooming was causing the image to tilt
+      // a few degrees off-axis. Rotation is still available via the
+      // rotateLeft / rotateRight toolbar buttons.
       const dist = getTouchDist(e.touches);
-      const angle = getTouchAngle(e.touches);
       if (lastDist > 0) {
         const ds = dist / lastDist;
         layer.transform.scale = clamp(layer.transform.scale * ds, 0.1, PREVIEW_MAX_SCALE);
         lastDist = dist;
       }
-      layer.transform.rotation += (angle - lastAngle);
-      lastAngle = angle;
       applyTransform(layer);
     } else if (e.touches.length === 1 && touchStart && dragging) {
       e.preventDefault();
@@ -2995,7 +2995,6 @@ function showPreview(src) {
     dragging = false;
     touchStart = null;
     lastDist = 0;
-    lastAngle = 0;
     gestureLayerId = null;
   });
 })();
@@ -3004,11 +3003,6 @@ function getTouchDist(touches) {
   const dx = touches[0].clientX - touches[1].clientX;
   const dy = touches[0].clientY - touches[1].clientY;
   return Math.sqrt(dx * dx + dy * dy);
-}
-function getTouchAngle(touches) {
-  const dx = touches[0].clientX - touches[1].clientX;
-  const dy = touches[0].clientY - touches[1].clientY;
-  return Math.atan2(dy, dx) * 180 / Math.PI;
 }
 function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
 

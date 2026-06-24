@@ -106,6 +106,10 @@ public:
     void powerOff();
     /** @brief Sends a status event. */
     bool statusEventSend(EventBits_t event_bits);
+    /** @brief Suspends the LED status-indicator task so the caller can drive the LED directly. */
+    void ledStatusSuspend();
+    /** @brief Resumes the LED status-indicator task after a ledStatusSuspend(). */
+    void ledStatusResume();
 
 private:
     void i2cBusRecovery();
