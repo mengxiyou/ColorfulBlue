@@ -610,6 +610,30 @@ esp_err_t app_manager_start()
     photo_slideshow.start();
     ESP_LOGI(g_tag, "Slideshow ready (no boot refresh; LED green = AP idle)");
 
+    // Auto-reconnect to the saved STA in the background. settingsInit loads
+    // wifi_ssid/wifi_pass from NVS into hal.settings, but nothing else turns
+    // those into a connect call — without this, the device only joins STA
+    // after the user re-submits the captive-portal form. WiFi.connect blocks
+    // until it succeeds / times out, so we fire it off a one-shot task to
+    // keep app_main moving (button handling + AP must come up promptly).
+    if (hal.settings.wifi_ssid[0] != '\0') {
+        xTaskCreate(
+            [](void *) {
+                ESP_LOGI(g_tag, "Auto-connect: SSID='%s'", hal.settings.wifi_ssid);
+                esp_err_t err = WiFi.connect(hal.settings.wifi_ssid, hal.settings.wifi_password, 15000);
+                if (err == ESP_OK) {
+                    ESP_LOGI(g_tag, "Auto-connect: STA up");
+                } else {
+                    ESP_LOGW(g_tag, "Auto-connect: failed (%s) — AP stays up for re-config",
+                             esp_err_to_name(err));
+                }
+                vTaskDelete(nullptr);
+            },
+            "wifi_auto", 4096, nullptr, 4, nullptr);
+    } else {
+        ESP_LOGI(g_tag, "Auto-connect: no SSID saved, staying AP-only until web config");
+    }
+
     xTaskCreate(app_task, "app_mgr", 10240, NULL, 5, NULL);
     return ESP_OK;
 }
