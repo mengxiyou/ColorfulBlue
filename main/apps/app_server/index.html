@@ -1449,6 +1449,20 @@ SPDX-License-Identifier: MIT
           </div>
         </div>
 
+        <!-- Daily image URLs (rotated by short-tap of front-panel C) -->
+        <div class="settings-section">
+          <div class="section-title">Daily images (C button)</div>
+          <div style="font-size:12px;color:var(--muted);margin-bottom:8px;line-height:1.5;">
+            短按 C 按顺序拉取这些 PNG 并显示，循环。最多 <span id="daily-url-max">10</span> 条；开机后第一次按 C 显示第 1 条。
+          </div>
+          <div id="daily-url-list"></div>
+          <div style="display:flex;gap:8px;margin-top:8px;align-items:center;">
+            <button type="button" class="btn btn-outline btn-sm" id="daily-url-add-btn" onclick="addDailyUrlRow()">+ Add</button>
+            <button type="button" class="btn btn-success btn-sm" onclick="saveDailyImageUrls()">Save</button>
+            <span id="daily-url-status" style="margin-left:auto;font-size:12px;color:var(--muted);"></span>
+          </div>
+        </div>
+
         <!-- System -->
         <div class="settings-section">
           <div class="section-title">System</div>
@@ -2615,6 +2629,9 @@ function showSettings() {
   // Pre-fill Wi-Fi & Device (async)
   loadSettingsDeviceInfo();
 
+  // Pre-fill the C-button daily-image rotation list (async).
+  loadDailyImageUrls();
+
   // Show/hide Wi-Fi section
   const wifiSection = document.getElementById("settings-wifi-section");
   if (wifiSection) {
@@ -2773,6 +2790,93 @@ function selectSettingsNetwork(encodedSsid) {
   document.getElementById("settings-ssid-select").classList.remove("open");
   document.getElementById("settings-network-list").classList.add("hidden");
   updateSettingsSaveBtn();
+}
+
+// ---------- Daily image URLs (front-panel C rotation) ----------
+const DAILY_URL_MAX_HARD = 10;
+
+async function loadDailyImageUrls() {
+  try {
+    const data = await apiCall("GET", "/api/daily-images");
+    renderDailyUrlList(data.urls || [], data.max || DAILY_URL_MAX_HARD);
+  } catch(e) {
+    renderDailyUrlList([], DAILY_URL_MAX_HARD);
+  }
+}
+
+function renderDailyUrlList(urls, max) {
+  const listEl = document.getElementById("daily-url-list");
+  if (!listEl) return;
+  listEl.innerHTML = "";
+  const maxEl = document.getElementById("daily-url-max");
+  if (maxEl) maxEl.textContent = max;
+  (urls || []).forEach(u => appendDailyUrlRow(u));
+  updateDailyUrlControls();
+}
+
+function appendDailyUrlRow(value) {
+  const listEl = document.getElementById("daily-url-list");
+  if (!listEl) return;
+  const row = document.createElement("div");
+  row.className = "daily-url-row";
+  row.style.cssText = "display:flex;gap:6px;margin-bottom:6px;align-items:center;";
+
+  const inp = document.createElement("input");
+  inp.type = "url";
+  inp.className = "form-input";
+  inp.placeholder = "http://example.com/image.png";
+  inp.value = value || "";
+  inp.style.flex = "1";
+
+  const del = document.createElement("button");
+  del.type = "button";
+  del.className = "btn btn-danger-outline btn-sm";
+  del.textContent = "×";
+  del.title = "Remove";
+  del.style.minWidth = "32px";
+  del.onclick = () => { row.remove(); updateDailyUrlControls(); };
+
+  row.appendChild(inp);
+  row.appendChild(del);
+  listEl.appendChild(row);
+}
+
+function addDailyUrlRow() {
+  const listEl = document.getElementById("daily-url-list");
+  if (!listEl) return;
+  const max = parseInt(document.getElementById("daily-url-max")?.textContent || DAILY_URL_MAX_HARD, 10);
+  if (listEl.querySelectorAll(".daily-url-row").length >= max) return;
+  appendDailyUrlRow("");
+  updateDailyUrlControls();
+}
+
+function updateDailyUrlControls() {
+  const listEl = document.getElementById("daily-url-list");
+  if (!listEl) return;
+  const count = listEl.querySelectorAll(".daily-url-row").length;
+  const max = parseInt(document.getElementById("daily-url-max")?.textContent || DAILY_URL_MAX_HARD, 10);
+  const addBtn = document.getElementById("daily-url-add-btn");
+  if (addBtn) addBtn.disabled = count >= max;
+  const statusEl = document.getElementById("daily-url-status");
+  if (statusEl) statusEl.textContent = count + " / " + max;
+}
+
+async function saveDailyImageUrls() {
+  const listEl = document.getElementById("daily-url-list");
+  if (!listEl) return;
+  const urls = Array.from(listEl.querySelectorAll(".daily-url-row input"))
+    .map(i => i.value.trim())
+    .filter(u => u.length > 0);
+  const statusEl = document.getElementById("daily-url-status");
+  if (statusEl) statusEl.textContent = "Saving…";
+  try {
+    const data = await apiCall("POST", "/api/daily-images", { urls });
+    renderDailyUrlList(data.urls || [], data.max || DAILY_URL_MAX_HARD);
+    if (statusEl) statusEl.textContent = "Saved (" + (data.urls?.length || 0) + ")";
+    setTimeout(() => updateDailyUrlControls(), 1500);
+  } catch(e) {
+    if (statusEl) statusEl.textContent = "Error: " + (e.message || e);
+  }
 }
 
 async function saveWiFiSettings() {

@@ -279,6 +279,20 @@ void Hal::settingsInit()
             cstring_copy(settings.device_name, normalized_device_name, sizeof(settings.device_name));
         }
 
+        // Daily image URL list: count in "daily_n", entries in "daily_0".."daily_9".
+        uint8_t url_count = 0;
+        if (nvs_get_u8(nvs_handle, "daily_n", &url_count) == ESP_OK && url_count <= DAILY_IMAGE_URL_MAX) {
+            settings.daily_image_url_count = url_count;
+            char key[16];
+            for (uint8_t url_index = 0; url_index < url_count; url_index++) {
+                snprintf(key, sizeof(key), "daily_%u", (unsigned)url_index);
+                value_size = DAILY_IMAGE_URL_MAXLEN;
+                if (nvs_get_str(nvs_handle, key, settings.daily_image_urls[url_index], &value_size) != ESP_OK) {
+                    settings.daily_image_urls[url_index][0] = '\0';
+                }
+            }
+        }
+
         nvs_close(nvs_handle);
     }
 
@@ -378,6 +392,26 @@ void Hal::settingsSave(SettingKey key)
                 nvs_set_str(h, "device_name", settings.device_name);
                 changed = true;
             }
+            break;
+        }
+        case SETTING_DAILY_IMAGE_URLS: {
+            // Rewrite the whole list: count + every kept entry, then erase
+            // any trailing keys from a previously longer list so NVS doesn't
+            // leak stale URLs across saves.
+            uint8_t prev_count = 0;
+            (void)nvs_get_u8(h, "daily_n", &prev_count);
+            nvs_set_u8(h, "daily_n", settings.daily_image_url_count);
+            char key[16];
+            for (uint8_t url_index = 0; url_index < settings.daily_image_url_count; url_index++) {
+                snprintf(key, sizeof(key), "daily_%u", (unsigned)url_index);
+                nvs_set_str(h, key, settings.daily_image_urls[url_index]);
+            }
+            for (uint8_t url_index = settings.daily_image_url_count;
+                 url_index < prev_count && url_index < DAILY_IMAGE_URL_MAX; url_index++) {
+                snprintf(key, sizeof(key), "daily_%u", (unsigned)url_index);
+                nvs_erase_key(h, key);
+            }
+            changed = true;
             break;
         }
     }

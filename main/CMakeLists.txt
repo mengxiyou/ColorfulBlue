@@ -19,6 +19,7 @@ idf_component_register(
         "hal/utils/dns_server"
     REQUIRES
         esp_http_server
+        esp_http_client
         esp_wifi
         nvs_flash
         fatfs

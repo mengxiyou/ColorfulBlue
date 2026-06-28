@@ -79,3 +79,7 @@ Desktop.ini
 # Visual Studio Code
 .vscode/
 .cache/
+
+# Local-only build / provisioning scripts that embed secrets (Wi-Fi creds,
+# daily-image URLs). Live in scripts/local/, never committed.
+/scripts/local/

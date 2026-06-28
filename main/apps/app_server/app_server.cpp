@@ -1033,6 +1033,93 @@ static esp_err_t h_mode_cfg_set(httpd_req_t *req)
     return ESP_OK;
 }
 
+// GET /api/daily-images — return the current rotation list + the hard limit.
+//   { "urls": [...], "max": 10 }
+static esp_err_t h_daily_images_get(httpd_req_t *req)
+{
+    cJSON *r       = cJSON_CreateObject();
+    cJSON *url_arr = cJSON_CreateArray();
+    hal.settingsLock();
+    for (uint8_t url_index = 0; url_index < hal.settings.daily_image_url_count; url_index++) {
+        cJSON_AddItemToArray(url_arr, cJSON_CreateString(hal.settings.daily_image_urls[url_index]));
+    }
+    hal.settingsUnlock();
+    cJSON_AddItemToObject(r, "urls", url_arr);
+    cJSON_AddNumberToObject(r, "max", DAILY_IMAGE_URL_MAX);
+    send_json_response(req, r);
+    cJSON_Delete(r);
+    return ESP_OK;
+}
+
+// POST /api/daily-images — replace the rotation list.
+//   request:  { "urls": [...] }   (0..DAILY_IMAGE_URL_MAX entries)
+//   response: same shape as GET
+// Empty strings, non-http(s) schemes, and over-long URLs are rejected with 400.
+static esp_err_t h_daily_images_set(httpd_req_t *req)
+{
+    // Worst case body: 10 × 256-char URL + JSON overhead. Allocate on heap.
+    int content_len = req->content_len;
+    if (content_len <= 0 || content_len > (int)((DAILY_IMAGE_URL_MAX * DAILY_IMAGE_URL_MAXLEN) + 256)) {
+        return send_error_response(req, 400, "bad length");
+    }
+    char *buf = (char *)malloc(content_len + 1);
+    if (!buf) return send_error_response(req, 500, "oom");
+    int len = httpd_req_recv(req, buf, content_len);
+    if (len <= 0) {
+        free(buf);
+        return send_error_response(req, 400, "no body");
+    }
+    buf[len]  = 0;
+    cJSON *j  = cJSON_Parse(buf);
+    free(buf);
+    if (!j) return send_error_response(req, 400, "bad json");
+
+    cJSON *url_arr = cJSON_GetObjectItem(j, "urls");
+    if (!cJSON_IsArray(url_arr)) {
+        cJSON_Delete(j);
+        return send_error_response(req, 400, "urls must be array");
+    }
+    int incoming_count = cJSON_GetArraySize(url_arr);
+    if (incoming_count > DAILY_IMAGE_URL_MAX) {
+        cJSON_Delete(j);
+        return send_error_response(req, 400, "too many urls");
+    }
+
+    // Stage into a local buffer first so a validation failure doesn't leave
+    // hal.settings in a half-written state.
+    char staged[DAILY_IMAGE_URL_MAX][DAILY_IMAGE_URL_MAXLEN];
+    memset(staged, 0, sizeof(staged));
+    uint8_t staged_count = 0;
+    for (int url_index = 0; url_index < incoming_count; url_index++) {
+        cJSON *entry = cJSON_GetArrayItem(url_arr, url_index);
+        if (!cJSON_IsString(entry)) {
+            cJSON_Delete(j);
+            return send_error_response(req, 400, "url must be string");
+        }
+        const char *url = entry->valuestring;
+        size_t url_len  = strlen(url);
+        if (url_len == 0 || url_len >= DAILY_IMAGE_URL_MAXLEN) {
+            cJSON_Delete(j);
+            return send_error_response(req, 400, "url empty or too long");
+        }
+        if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0) {
+            cJSON_Delete(j);
+            return send_error_response(req, 400, "url must be http(s)");
+        }
+        cstring_copy(staged[staged_count++], url, DAILY_IMAGE_URL_MAXLEN);
+    }
+    cJSON_Delete(j);
+
+    hal.settingsLock();
+    hal.settings.daily_image_url_count = staged_count;
+    memcpy(hal.settings.daily_image_urls, staged, sizeof(staged));
+    hal.settingsUnlock();
+    hal.settingsSave(SETTING_DAILY_IMAGE_URLS);
+    ESP_LOGI(TAG, "daily-images: replaced list with %u entries", (unsigned)staged_count);
+
+    return h_daily_images_get(req);
+}
+
 static esp_err_t h_data_serve(httpd_req_t *req)
 {
     const char *fp = req->uri + 6; /* Skip "/data/" */
@@ -1212,6 +1299,8 @@ static const httpd_uri_t routes[] = {
     {"/api/battery", HTTP_GET, h_battery},
     {"/api/mode/mode_1/config", HTTP_GET, h_mode_cfg_get},
     {"/api/mode/mode_1/config", HTTP_POST, h_mode_cfg_set},
+    {"/api/daily-images", HTTP_GET, h_daily_images_get},
+    {"/api/daily-images", HTTP_POST, h_daily_images_set},
     {"/data/*", HTTP_GET, h_data_serve},
     {"/api/photos/display", HTTP_POST, h_photos_display},
     {"/api/system/reset", HTTP_POST, h_system_reset},

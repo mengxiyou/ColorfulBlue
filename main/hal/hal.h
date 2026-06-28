@@ -24,8 +24,14 @@ enum SettingKey : uint8_t {
     SETTING_INTERVAL,
     SETTING_BOOT_SOUND,
     SETTING_DEVICE_NAME,
-    SETTING_LOW_POWER_MODE
+    SETTING_LOW_POWER_MODE,
+    SETTING_DAILY_IMAGE_URLS,  // whole list (count + all entries) saved as one op
 };
+
+/** @brief Maximum number of "daily image" URLs rotated by the C button. */
+static constexpr uint8_t DAILY_IMAGE_URL_MAX = 10;
+/** @brief Per-URL buffer length (bytes, includes NUL). */
+static constexpr size_t DAILY_IMAGE_URL_MAXLEN = 256;
 
 /** @brief Normalizes a device name. */
 bool normalize_device_name(const char* input, char* output, size_t output_size);
@@ -46,6 +52,8 @@ struct Settings {
     bool boot_sound;
     char device_name[64];
     bool low_power_mode;
+    uint8_t daily_image_url_count;
+    char daily_image_urls[DAILY_IMAGE_URL_MAX][DAILY_IMAGE_URL_MAXLEN];
 };
 
 #define OPERATION_EVENT_FAILED           BIT0

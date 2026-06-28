@@ -153,13 +153,15 @@ private:
     volatile bool _running = false;
     bool _needs_refresh    = false;
 
-    uint32_t _last_refresh_ms = 0;
-    uint32_t _last_button_ms  = 0;
-    bool _last_btn_c          = false;
-    bool _last_btn_b          = false;
-    bool _last_btn_a          = false;
-    bool _last_sd_inserted    = false;
-    bool _sd_fallback_locked  = false;
+    uint32_t _last_refresh_ms     = 0;
+    uint32_t _last_button_ms      = 0;
+    bool _last_btn_b              = false;
+    bool _last_btn_a              = false;
+    bool _btn_c_pressed_prev       = false;  // C tracked via isPressed() edges
+    uint32_t _btn_c_press_start_ms = 0;
+    bool _btn_c_long_handled       = false;
+    bool _last_sd_inserted        = false;
+    bool _sd_fallback_locked      = false;
 
     /* ---- Internal helpers ---- */
     void syncSettings();

@@ -6,19 +6,24 @@
 #include "local_photo_slideshow.h"
 #include <cstring>
 #include <cctype>
+#include <cstdlib>
 #include <algorithm>
 #include <dirent.h>
 #include <strings.h>
 #include "esp_log.h"
 #include "esp_log_level.h"
 #include "esp_timer.h"
+#include "esp_http_client.h"
 #include <M5Unified.h>
 #include "hal/storage/hal_storage.h"
 #include "hal/hal.h"
+#include "hal/wifi/hal_wifi.h"
 #include "hal/utils/audio/audio.h"
 #include "hal/utils/image/image_utils.h"
 #include "freertos/task.h"
 #include "apps/app_manager/app_manager.h"
+
+using namespace hal_wifi;
 
 static const char *TAG = "Slideshow";
 
@@ -109,7 +114,9 @@ bool PhotoSlideshow::init(const char *dir_path, uint8_t interval_min)
     _pending_index              = NO_PHOTO;
     _running                    = false;
     _needs_refresh              = false;
-    _last_btn_c                 = false;
+    _btn_c_pressed_prev         = false;
+    _btn_c_press_start_ms       = 0;
+    _btn_c_long_handled         = false;
     _last_btn_b                 = false;
     _last_sd_inserted           = hal.isSDCardInserted();
     _sd_fallback_locked         = false;
@@ -378,22 +385,217 @@ bool PhotoSlideshow::isWaitingSettle() const
     return _needs_refresh;
 }
 
+/* ====================== Daily image fetch & display ====================== */
+namespace {
+
+// The rotation list lives in hal.settings.daily_image_urls (configured via
+// the captive web portal at /api/daily-images). Each short C tap copies the
+// next URL out of settings under the mutex, advances the index, and fetches
+// it. The index resets only on reboot, so the first tap after power-on hits
+// the first URL.
+
+// HTTP GET into a heap buffer. On success returns true and hands ownership of
+// *out_buf (free with std::free) plus the length in *out_len. On failure
+// returns false and leaves *out_buf nullptr.
+bool fetch_url_to_buffer(const char *url, uint8_t **out_buf, size_t *out_len)
+{
+    *out_buf = nullptr;
+    *out_len = 0;
+
+    esp_http_client_config_t cfg = {};
+    cfg.url                      = url;
+    cfg.timeout_ms               = 10000;
+    cfg.method                   = HTTP_METHOD_GET;
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        ESP_LOGE(TAG, "http_client_init failed");
+        return false;
+    }
+
+    bool ok       = false;
+    uint8_t *buf  = nullptr;
+    size_t cap    = 0;
+    size_t total  = 0;
+    int64_t clen  = 0;
+    int status    = 0;
+    esp_err_t err = esp_http_client_open(client, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "http_client_open failed: %s", esp_err_to_name(err));
+        goto done;
+    }
+
+    clen   = esp_http_client_fetch_headers(client);
+    status = esp_http_client_get_status_code(client);
+    if (status != 200) {
+        ESP_LOGE(TAG, "HTTP status %d for %s", status, url);
+        goto done;
+    }
+
+    cap = (clen > 0) ? (size_t)clen : (64 * 1024);
+    buf = (uint8_t *)malloc(cap);
+    if (!buf) {
+        ESP_LOGE(TAG, "malloc(%zu) failed", cap);
+        goto done;
+    }
+
+    while (true) {
+        if (total >= cap) {
+            size_t new_cap = cap * 2;
+            uint8_t *nbuf  = (uint8_t *)realloc(buf, new_cap);
+            if (!nbuf) {
+                ESP_LOGE(TAG, "realloc(%zu) failed", new_cap);
+                goto done;
+            }
+            buf = nbuf;
+            cap = new_cap;
+        }
+        int r = esp_http_client_read(client, (char *)(buf + total), cap - total);
+        if (r < 0) {
+            ESP_LOGE(TAG, "http_client_read failed at %zu/%zu", total, cap);
+            goto done;
+        }
+        if (r == 0) break;
+        total += (size_t)r;
+    }
+
+    *out_buf = buf;
+    *out_len = total;
+    buf      = nullptr;  // ownership transferred
+    ok       = true;
+
+done:
+    if (buf) free(buf);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    return ok;
+}
+
+void display_next_daily_image()
+{
+    // Snapshot the next URL (and advance the rotation index) under the
+    // settings mutex so the web server can't mutate the list while we're
+    // copying. The index is advanced unconditionally — a broken URL can be
+    // skipped past with another tap instead of getting stuck. If the list is
+    // empty, the index stays at 0 and the press is a no-op besides the ack.
+    static size_t next_idx = 0;
+    char url[DAILY_IMAGE_URL_MAXLEN] = {};
+    uint8_t url_count                = 0;
+    hal.settingsLock();
+    url_count = hal.settings.daily_image_url_count;
+    if (url_count > 0) {
+        if (next_idx >= url_count) next_idx = 0;
+        cstring_copy(url, hal.settings.daily_image_urls[next_idx], sizeof(url));
+        next_idx = (next_idx + 1) % url_count;
+    }
+    hal.settingsUnlock();
+
+    if (url_count == 0) {
+        ESP_LOGW(TAG, "Daily image: rotation list is empty, configure /api/daily-images");
+        return;
+    }
+
+    ESP_LOGI(TAG, "display_next_daily_image: url=%s wifi=%d", url, WiFi.isConnected() ? 1 : 0);
+
+    // No beeps here — handleButtons() already played the ack tone on release.
+    if (!WiFi.isConnected()) {
+        ESP_LOGW(TAG, "Daily image: WiFi STA not connected, aborting (%s)", url);
+        return;
+    }
+
+    uint8_t *data = nullptr;
+    size_t len    = 0;
+    if (!fetch_url_to_buffer(url, &data, &len)) {
+        return;
+    }
+
+    int img_w = 0, img_h = 0;
+    if (!get_image_size_from_memory(data, len, &img_w, &img_h, ".png")) {
+        ESP_LOGE(TAG, "Daily image: PNG decode header failed (len=%zu, url=%s)", len, url);
+        free(data);
+        return;
+    }
+
+    int scr_w  = hal.Canvas->width();
+    int scr_h  = hal.Canvas->height();
+    float s    = std::min((float)scr_w / img_w, (float)scr_h / img_h);
+    int draw_x = (scr_w - (int)(img_w * s)) / 2;
+    int draw_y = (scr_h - (int)(img_h * s)) / 2;
+
+    hal.Canvas->fillScreen(TFT_WHITE);
+    hal.Canvas->drawPng(data, len, draw_x, draw_y, 0, 0, 0, 0, s, s);
+    free(data);
+
+    hal.statusEventSend(OPERATION_EVENT_REFRESH_START);
+    app_manager_set_refresh_in_progress(true);
+    hal.Canvas->pushSprite(0, 0);
+    app_manager_set_refresh_in_progress(false);
+    hal.statusEventSend(OPERATION_EVENT_REFRESH_COMPLETE);
+    ESP_LOGI(TAG, "Daily image displayed (%dx%d, %zu bytes, url=%s)", img_w, img_h, len, url);
+}
+
+}  // namespace
+
 /* ====================== Button handling ====================== */
 void PhotoSlideshow::handleButtons()
-{  // A 523
-    bool button_a_pressed  = M5.BtnA.wasPressed();
+{
+    // A = prev, B = next.
+    // C: short tap cycles daily images (poster → wordcloud → poster → …);
+    //    long press (≥ BTN_C_LONG_PRESS_MS held) shuts down. C is read via
+    //    isPressed() edges + manual timing so the two paths are orthogonal,
+    //    and the short-tap action fires immediately on release for snappiness.
+    //    Short-tap release plays the ack tone (so the user hears feedback
+    //    even when WiFi is not connected). Long-press release skips the ack
+    //    so the shutdown chime isn't followed by an extra "tap" beep.
+    static constexpr uint32_t BTN_C_LONG_PRESS_MS = 800;
+
     bool button_a_released = M5.BtnA.wasClicked();
-    bool button_c_pressed  = M5.BtnC.wasPressed();
     bool button_b_pressed  = M5.BtnB.wasPressed();
-    if (button_c_pressed) audio::play_tone_from_midi(119, 0.08);
-    if (button_b_pressed) audio::play_tone_from_midi(120, 0.08);
-    if (button_a_pressed) audio::play_tone_from_midi(121, 0.08);
-    if (button_a_released && !_last_btn_a) toggleRotation();
-    if (button_c_pressed && !_last_btn_c) prev();
-    if (button_b_pressed && !_last_btn_b) next();
-    _last_btn_c = button_c_pressed;
-    _last_btn_b = button_b_pressed;
-    _last_btn_a = button_a_released;
+    bool button_c_now      = M5.BtnC.isPressed();
+
+    if (button_a_released && !_last_btn_a) {
+        audio::play_tone_from_midi(121, 0.08);
+        prev();
+    }
+    if (button_b_pressed && !_last_btn_b) {
+        audio::play_tone_from_midi(120, 0.08);
+        next();
+    }
+
+    // C: press edge — start the long-press timer.
+    if (button_c_now && !_btn_c_pressed_prev) {
+        _btn_c_press_start_ms = millis_();
+        _btn_c_long_handled   = false;
+        ESP_LOGI(TAG, "BtnC press");
+    }
+
+    // C: still held past threshold — fire shutdown (never returns) and mark
+    // the press so the release edge does NOT also fire the short-tap action.
+    if (button_c_now && !_btn_c_long_handled &&
+        millis_() - _btn_c_press_start_ms >= BTN_C_LONG_PRESS_MS) {
+        _btn_c_long_handled = true;
+        ESP_LOGI(TAG, "BtnC long-press -> shutdown");
+        app_manager_request_shutdown();
+    }
+
+    // C: release edge. Skip everything if a long-press already fired (the
+    // shutdown chime is enough feedback). Otherwise play the ack at A/B's
+    // pitch / duration and give the speaker DMA a brief moment to drain
+    // before the HTTP fetch starts blocking the task — otherwise the tone
+    // is cut short and sounds noticeably softer than A/B.
+    if (!button_c_now && _btn_c_pressed_prev) {
+        if (!_btn_c_long_handled) {
+            uint32_t held = millis_() - _btn_c_press_start_ms;
+            ESP_LOGI(TAG, "BtnC short tap (%u ms) -> next daily image", (unsigned)held);
+            audio::play_tone_from_midi(120, 0.08);
+            vTaskDelay(pdMS_TO_TICKS(100));
+            display_next_daily_image();
+        }
+    }
+
+    _last_btn_a         = button_a_released;
+    _last_btn_b         = button_b_pressed;
+    _btn_c_pressed_prev = button_c_now;
 }
 
 /* ============== Rescan ============== */
