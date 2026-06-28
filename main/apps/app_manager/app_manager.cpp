@@ -8,9 +8,7 @@
 #include "hal/wifi/hal_wifi.h"
 #include "hal/utils/audio/audio.h"
 #include "apps/local_photo_slideshow/local_photo_slideshow.h"
-#include "apps/ezdata_photo_push/ezdata_photo_push.h"
 #include "apps/app_server/app_server.h"
-#include "hal/ezdata/hal_ezdata.h"
 #include "esp_log.h"
 #include <esp_timer.h>
 #include "nvs_flash.h"
@@ -40,10 +38,8 @@ static const char* g_tag = "AppMgr";
 
 // ---- Global objects ----
 PhotoSlideshow photo_slideshow;
-EzdataPhotoPush ezdata_photo_push;
 
-// ---- Mode state ----
-static AppMode g_current_mode     = APP_MODE_LOCAL;
+// ---- State ----
 static uint32_t g_btn_press_start = 0;
 static bool g_btn_long_pressed    = false;
 
@@ -51,10 +47,7 @@ static bool g_btn_long_pressed    = false;
 static uint32_t g_ap_auto_off_timer     = 0;
 static bool g_ap_auto_off_timer_running = false;
 
-// ---- WiFi auto-reconnect ----
-static uint32_t g_wifi_reconnect_last_try_ms         = 0;
-static constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 10000;
-static bool g_wifi_reconnect_paused                  = false;
+// ---- Activity / refresh tracking ----
 static uint32_t g_low_power_last_activity_ms         = 0;
 static bool g_refresh_in_progress                    = false;
 static constexpr uint32_t LOW_POWER_IDLE_SHUTDOWN_MS = 60000;
@@ -63,11 +56,6 @@ static constexpr uint32_t LOW_POWER_IDLE_SHUTDOWN_MS = 60000;
 static inline uint32_t millis_()
 {
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
-}
-
-static bool mode_requires_sta(AppMode mode)
-{
-    return mode == APP_MODE_EZDATA;
 }
 
 static void get_ap_name(char* ap_name, size_t ap_name_size)
@@ -104,7 +92,6 @@ static esp_err_t ensure_apsta_started()
 
 static esp_err_t disconnect_sta_keep_ap_internal()
 {
-    g_wifi_reconnect_last_try_ms = 0;
     g_ap_auto_off_timer_running  = false;
 
     esp_err_t err = ensure_apsta_started();
@@ -118,46 +105,6 @@ static esp_err_t disconnect_sta_keep_ap_internal()
     }
 
     return ESP_OK;
-}
-
-static esp_err_t ensure_sta_connected_if_needed(bool wait_for_connect)
-{
-    esp_err_t err = ensure_apsta_started();
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    if (!mode_requires_sta(g_current_mode) || !hal.settings.wifi_ssid[0]) {
-        return ESP_OK;
-    }
-
-    uint32_t timeout_ms = wait_for_connect ? 15000 : 0;
-    err                 = WiFi.connect(hal.settings.wifi_ssid, hal.settings.wifi_password, timeout_ms);
-    if (err == ESP_OK && wait_for_connect) {
-        ESP_LOGI(g_tag, "STA IP : %s", WiFi.localIP().c_str());
-    }
-    return err;
-}
-
-// ---- Mode management ----
-static void apply_current_mode_setting()
-{
-    cstring_copy(hal.settings.current_mode, mode_id_from_app_mode(g_current_mode), sizeof(hal.settings.current_mode));
-    app_manager_set_current_mode(hal.settings.current_mode);
-}
-
-static void start_current_mode()
-{
-    if (g_current_mode == APP_MODE_NONE) {
-        return;
-    } else if (g_current_mode == APP_MODE_EZDATA) {
-        ezdata_photo_push.init();
-        ezdata_photo_push.start();
-        ESP_LOGI(g_tag, "Started EZDATA mode");
-    } else {
-        photo_slideshow.start();
-        ESP_LOGI(g_tag, "Started LOCAL mode");
-    }
 }
 
 static bool prepare_next_low_power_wake()
@@ -259,134 +206,21 @@ static bool run_rtc_wake_one_shot_cycle()
         return false;
     }
 
-    ESP_LOGI(g_tag, "RTC wake low-power cycle start, mode=%s", mode_id_from_app_mode(g_current_mode));
+    ESP_LOGI(g_tag, "RTC wake low-power cycle start");
 
-    if (g_current_mode == APP_MODE_LOCAL) {
-        photo_slideshow.init("/data", 0);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        bool refreshed = photo_slideshow.runOneShotRefresh();
-        if (!refreshed) {
-            ESP_LOGW(g_tag, "RTC one-shot local refresh did not display a photo");
-        }
-        shutdown_after_low_power_cycle();
-    }
-
-    if (g_current_mode == APP_MODE_EZDATA) {
-        ezdata_photo_push.init(0);
-
-        ESP_ERROR_CHECK(WiFi.begin());
-        ESP_ERROR_CHECK(ensure_apsta_started());
-        if (hal.settings.wifi_ssid[0]) {
-            esp_err_t connect_err = ensure_sta_connected_if_needed(true);
-            if (connect_err != ESP_OK) {
-                ESP_LOGW(g_tag, "RTC one-shot STA connect failed: %s", esp_err_to_name(connect_err));
-                shutdown_after_low_power_cycle();
-            }
-        }
-
-        const uint32_t deadline = millis_() + 30000;
-        while (millis_() < deadline) {
-            hal.update();
-            ezdata_photo_push.update();
-            if (ezdata_is_connected() && ezdata_get_photo_count() != 0) {
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-
-        bool refreshed = ezdata_photo_push.runOneShotRefresh();
-        if (!refreshed) {
-            ESP_LOGW(g_tag, "RTC one-shot ezdata refresh did not display a photo");
-        }
-        shutdown_after_low_power_cycle();
+    photo_slideshow.init("/data", 0);
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    if (!photo_slideshow.runOneShotRefresh()) {
+        ESP_LOGW(g_tag, "RTC one-shot local refresh did not display a photo");
     }
 
     shutdown_after_low_power_cycle();
     return true;
 }
 
-static void stop_current_mode()
-{
-    if (g_current_mode == APP_MODE_NONE) {
-        return;
-    } else if (g_current_mode == APP_MODE_EZDATA) {
-        ezdata_photo_push.deinit();
-    } else {
-        photo_slideshow.stop();
-    }
-}
-
-static void switch_app_mode(AppMode target_mode)
-{
-    if (g_current_mode == target_mode) return;
-
-    stop_current_mode();
-    g_current_mode = target_mode;
-
-    if (mode_requires_sta(g_current_mode)) {
-        esp_err_t err = ensure_sta_connected_if_needed(false);
-        if (err != ESP_OK) {
-            ESP_LOGW(g_tag, "Failed to bring up STA for EZDATA mode: %s", esp_err_to_name(err));
-        }
-    } else {
-        esp_err_t err = disconnect_sta_keep_ap_internal();
-        if (err != ESP_OK) {
-            ESP_LOGW(g_tag, "Failed to disconnect STA while switching to LOCAL mode: %s", esp_err_to_name(err));
-        }
-    }
-
-    if (g_current_mode == APP_MODE_LOCAL) {
-        photo_slideshow.init("/data", hal.settings.auto_slideshow ? (uint8_t)hal.settings.interval_minutes : 0);
-    }
-
-    start_current_mode();
-    apply_current_mode_setting();
-}
-
-// ---- Pause WiFi auto-reconnect (used during scanning/provisioning) ----
-
-void app_manager_pause_wifi_reconnect(void)
-{
-    g_wifi_reconnect_paused = true;
-}
-
-void app_manager_resume_wifi_reconnect(void)
-{
-    g_wifi_reconnect_paused = false;
-}
-
 esp_err_t app_manager_disconnect_sta_keep_ap(void)
 {
     return disconnect_sta_keep_ap_internal();
-}
-
-// ---- Mode interface (web calls) ----
-esp_err_t app_manager_apply_mode(const char* mode_id)
-{
-    AppMode target = app_mode_from_mode_id(mode_id);
-    if (g_current_mode == target) {
-        apply_current_mode_setting();
-        return ESP_OK;
-    }
-    switch_app_mode(target);
-    return ESP_OK;
-}
-
-esp_err_t app_manager_set_current_mode(const char* mode_id)
-{
-    char normalized[sizeof(hal.settings.current_mode)] = {0};
-    normalize_mode_id(mode_id, normalized, sizeof(normalized));
-    if (!is_supported_mode_id(normalized) || cstring_compare(mode_id, normalized) != 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    cstring_copy(hal.settings.current_mode, normalized, sizeof(hal.settings.current_mode));
-    hal.settingsSave(SETTING_CURRENT_MODE);
-
-    // also update app_server's copy
-    app_server_sync_mode(normalized);
-
-    return ESP_OK;
 }
 
 // ---- WiFi QR code display ----
@@ -440,7 +274,6 @@ static void show_wifi_config_qrcode(const char* ap_ssid)
 #else
     const char* bg_path = "/data/PaperColor.png";
     hal.Canvas->fillScreen(TFT_WHITE);
-    hal_storage_prepare_photo_fs_access();
     hal_storage_lock();
     if (get_image_size_from_file(bg_path, &img_w, &img_h)) {
         float s    = std::min((float)scr_w / img_w, (float)scr_h / img_h);
@@ -506,7 +339,7 @@ void app_manager_factory_reset_machine()
 {
     ESP_LOGI(g_tag, "Factory reset: restoring defaults");
 
-    stop_current_mode();
+    photo_slideshow.stop();
 
     hal.settingsLock();
     memset(&hal.settings, 0, sizeof(hal.settings));
@@ -523,13 +356,10 @@ void app_manager_factory_reset_machine()
     hal.settingsSave(SETTING_ROTATION);
     hal.settingsSave(SETTING_AUTO_SLIDESHOW);
     hal.settingsSave(SETTING_INTERVAL);
-    hal.settingsSave(SETTING_CURRENT_MODE);
     hal.settingsSave(SETTING_BOOT_SOUND);
     hal.settingsSave(SETTING_DEVICE_NAME);
     hal.settingsSave(SETTING_LOW_POWER_MODE);
 
-    g_current_mode = APP_MODE_NONE;
-    app_server_sync_mode("");
     hal.Canvas->setRotation(1);
     display_boot_guide_image();
 
@@ -648,39 +478,8 @@ static void app_task(void* param)
         }
 #endif
 
-        // ==================== WiFi status LED refresh + auto-reconnect ====================
-        {
-            static uint32_t s_last_wifi_check = 0;
-            if (millis_() - s_last_wifi_check >= 3000) {
-                s_last_wifi_check = millis_();
-                if (mode_requires_sta(g_current_mode) && hal.settings.wifi_ssid[0] && !WiFi.isConnected()) {
-                    hal.statusEventSend(OPERATION_EVENT_WAITING_WIFI);
-                }
-            }
-
-            if (mode_requires_sta(g_current_mode) && hal.settings.wifi_ssid[0] && !WiFi.isConnected() &&
-                !g_wifi_reconnect_paused) {
-                uint32_t now = millis_();
-                if (g_wifi_reconnect_last_try_ms == 0 ||
-                    now - g_wifi_reconnect_last_try_ms >= WIFI_RECONNECT_INTERVAL_MS) {
-                    g_wifi_reconnect_last_try_ms = now;
-                    ESP_LOGI(g_tag, "WiFi disconnected, retrying STA connect to %s", hal.settings.wifi_ssid);
-                    WiFi.connect(hal.settings.wifi_ssid, hal.settings.wifi_password, 0);
-                }
-            } else {
-                g_wifi_reconnect_last_try_ms = 0;
-            }
-        }
-
-        // ==================== Dual-mode update ====================
-        AppMode active = g_current_mode;
-        if (active != APP_MODE_NONE) {
-            photo_slideshow.update();
-        }
-
-        if (active == APP_MODE_EZDATA && g_current_mode == APP_MODE_EZDATA) {
-            ezdata_photo_push.update();
-        }
+        // ==================== Slideshow update ====================
+        photo_slideshow.update();
 
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -726,51 +525,25 @@ esp_err_t app_manager_start()
         }
     }
 
-    g_current_mode = app_mode_from_mode_id(hal.settings.current_mode);
-
     if (run_rtc_wake_one_shot_cycle()) {
         return ESP_OK;
     }
 
-    if (g_current_mode == APP_MODE_LOCAL) {
-        photo_slideshow.init("/data", hal.settings.auto_slideshow ? (uint8_t)hal.settings.interval_minutes : 0);
-    }
+    photo_slideshow.init("/data", hal.settings.auto_slideshow ? (uint8_t)hal.settings.interval_minutes : 0);
 
     ESP_ERROR_CHECK(WiFi.begin());
     ESP_ERROR_CHECK(ensure_apsta_started());
-    if (mode_requires_sta(g_current_mode) && hal.settings.wifi_ssid[0]) {
-        esp_err_t connect_err = ensure_sta_connected_if_needed(true);
-        if (connect_err != ESP_OK) {
-            ESP_LOGW(g_tag, "Initial STA connect failed: %s", esp_err_to_name(connect_err));
-            hal.statusEventSend(OPERATION_EVENT_WAITING_WIFI);
-        }
-    }
 
-    // Determine whether to show the AP connection QR code
-    bool need_qrcode = false;
-    if (g_current_mode == APP_MODE_LOCAL) {
-        need_qrcode = false;
-    } else if (g_current_mode == APP_MODE_NONE) {
-        // Factory default: no mode selected, show the QR code to guide setup
-        need_qrcode = true;
-    } else if (!hal.settings.wifi_ssid[0]) {
-        // Mode selected but WiFi is not configured
-        need_qrcode = true;
-    } else if (mode_requires_sta(g_current_mode) && !WiFi.isConnected()) {
-        // WiFi is configured but connection failed
-        hal.statusEventSend(OPERATION_EVENT_WAITING_WIFI);
-        need_qrcode = true;
-    }
-
-    if (need_qrcode) {
+    // First-time setup hint: if no WiFi STA is configured yet, paint the SSID
+    // QR code on the e-paper so the user can join the device AP from a phone.
+    if (!hal.settings.wifi_ssid[0]) {
         char ap_name[32];
         get_ap_name(ap_name, sizeof(ap_name));
         show_wifi_config_qrcode(ap_name);
     }
 
-    start_current_mode();
-
-    ESP_LOGI(g_tag, "Default mode: %s", mode_id_from_app_mode(g_current_mode));
+    photo_slideshow.start();
+    ESP_LOGI(g_tag, "Slideshow started");
 
     xTaskCreate(app_task, "app_mgr", 10240, NULL, 5, NULL);
     return ESP_OK;

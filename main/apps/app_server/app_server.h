@@ -26,8 +26,6 @@ typedef struct {
 typedef struct {
     bool wifi_connected;
     char ip_address[16];
-    char current_mode[16];
-    char requested_mode[16];
     char current_image[64];
     char connected_ssid[33];
     char conn_err[32];
@@ -60,13 +58,6 @@ esp_err_t app_server_init(void);
  *      - An ESP error code if shutdown fails
  */
 esp_err_t app_server_stop(void);
-
-/**
- * @brief Synchronizes the server-side mode state with the active mode.
- *
- * @param mode_id Mode identifier to publish to the web layer.
- */
-void app_server_sync_mode(const char* mode_id);
 
 /**
  * @brief Returns the latest device state snapshot.
