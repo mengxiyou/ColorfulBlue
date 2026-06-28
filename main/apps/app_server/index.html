@@ -1308,9 +1308,45 @@ SPDX-License-Identifier: MIT
                   </button>
                   <div class="display-mode-menu hidden" id="display-mode-menu">
                     <div class="display-mode-option selected" data-val="dither" onclick="selectDisplayMode('dither')">Dither</div>
-                    <div class="display-mode-option" data-val="nearest" onclick="selectDisplayMode('nearest')">Nearest</div>
+                    <div class="display-mode-option" data-val="smart" onclick="selectDisplayMode('smart')">Smart</div>
+                    <div class="display-mode-option" data-val="mix" onclick="selectDisplayMode('mix')">Mix</div>
                   </div>
                 </div>
+                </div>
+
+                <div id="smooth-tune" class="hidden" style="margin-top:8px;padding:8px;border:1px solid #e0e0e0;border-radius:8px;font-size:12px;color:#555;">
+                  <div style="margin-bottom:4px;font-weight:600;">Smart tuning (live preview)</div>
+                  <label style="display:block;margin:6px 0;">Kernel(扩散核):
+                    <select id="dither-kernel" style="margin-left:6px;" onchange="onKernelChange()">
+                      <option value="fs">Floyd-Steinberg (smoother)</option>
+                      <option value="atkinson">Atkinson (sharper)</option>
+                    </select>
+                  </label>
+                  <div style="margin:6px 0 4px 0;">默认已保护 6 个纯色；<b>点击图片</b>可加保护色(如肤色)，点色块删除单个</div>
+                  <div id="pick-swatches" style="display:flex;flex-wrap:wrap;gap:4px;min-height:20px;margin:4px 0;"></div>
+                  <label style="display:block;margin:6px 0;">Range(颜色范围): <span id="prange-val">0.25</span>
+                    <input type="range" id="prange" min="0.05" max="0.6" step="0.01" value="0.25" style="width:100%;" oninput="onPickTuneChange()"></label>
+                  <label style="display:block;margin:6px 0;">Strength(强度): <span id="pstr-val">0.85</span>
+                    <input type="range" id="pstr" min="0" max="1" step="0.01" value="0.85" style="width:100%;" oninput="onPickTuneChange()"></label>
+                  <button type="button" onclick="resetPicks()" style="font-size:12px;padding:3px 8px;">重置(默认6纯色)</button>
+                </div>
+
+                <div id="mix-tune" class="hidden" style="margin-top:8px;padding:8px;border:1px solid #e0e0e0;border-radius:8px;font-size:12px;color:#555;">
+                  <div style="margin-bottom:4px;font-weight:600;">Mix tuning (live preview)</div>
+                  <div style="margin:4px 0 8px 0;color:#888;">Fixed palette: 6 inks mixed in N-part ratios, no pure colour. Pixels snap to the nearest mix, then the kernel diffuses residual.</div>
+                  <label style="display:block;margin:6px 0;">Kernel(扩散核):
+                    <select id="mix-kernel" style="margin-left:6px;" onchange="onKernelChange()">
+                      <option value="fs">Floyd-Steinberg (smoother)</option>
+                      <option value="atkinson">Atkinson (sharper)</option>
+                    </select>
+                  </label>
+                  <label style="display:block;margin:6px 0;">Parts(份数):
+                    <select id="mix-parts" style="margin-left:6px;" onchange="onMixPartsChange()">
+                      <option value="5" selected>5 parts (246 colours)</option>
+                      <option value="6">6 parts (456 colours)</option>
+                      <option value="7">7 parts (786 colours)</option>
+                    </select>
+                  </label>
                 </div>
 
                 <div class="upload-actions">
@@ -1518,14 +1554,27 @@ const EPD_PALETTE = [
   [0, 0, 255],
   [0, 255, 0],
 ];
-const EPD_PALETTE_ORIGINAL = [
+// Panel inks (Panel_ED2208 measured) for the web "Smooth" (v2) dither.
+const EPD_PALETTE_PANEL = [
   [0, 0, 0],
   [255, 255, 255],
   [255, 243, 56],
   [191, 0, 0],
-  [0, 0, 255],
+  [100, 64, 255],
   [67, 138, 28],
 ];
+// Colour-region protection (Smart mode): pixels within pickRange of any picked
+// colour get their dithering scaled down by pickStrength. Defaults to the 6 pure
+// inks (keeps near-pure regions clean); click the image to add more (e.g. skin).
+let pickColors = [];
+let pickRange = 0.25;
+let pickStrength = 0.85;
+// Smart / Mix shared error-diffusion kernel + Mix-only parts count
+// (live from the tuning panel selects):
+//   ditherKernel = "fs" (Floyd-Steinberg) | "atkinson"
+//   mixParts     = 4 | 5 | 6  (parts per palette entry in Mix mode; see _buildMixPalette)
+let ditherKernel = "fs";
+let mixParts = 5;
 let displayMode = "dither";
 let previewInkRenderToken = 0;
 let previewInkRenderTimer = null;
@@ -2334,20 +2383,529 @@ function quantizeToEpdPalette(imageData) {
   }
 }
 
-function quantizeToEpdPaletteOriginal(imageData) {
-  const { data } = imageData;
-  const palette = EPD_PALETTE_ORIGINAL;
+// ---- "Smooth" (v2) dither: linear-light Floyd-Steinberg with pure-ink
+//      protection. Mirrors the firmware algorithm and outputs exact panel inks so
+//      the device can display the uploaded result as-is (preview == device). ----
+let _v2lut = null;
+let _v2pal = null;
+let _v2pal_luma = null;
+// Neighbour-aware ink selection: when the colour-distance score is close
+// between two inks, prefer the one whose luminance is closer to the just-
+// placed neighbour. Hides high-contrast specks in flat regions (e.g. a
+// dither dot in a white area picks yellow over black).
+//   score(ink) = colorDist² + LUMA_NEIGHBOUR_WEIGHT * lumaDist²(ink, prevPixel)
+// 0 = old behaviour. Larger = smoother dither patterns at the cost of slight
+// colour drift. 0.15 is gentle: only breaks ties when colours are similar.
+const LUMA_NEIGHBOUR_WEIGHT = 0.15;
+// Anti-run penalty: a tiny constant added to the score when a candidate
+// matches the just-placed ink, so runs of identical ink in a row are
+// gently discouraged. 0.003 is small enough that a true colour match
+// (colorDist² ≈ 0, e.g. white in a pure white region) still wins; in a
+// flat region where error accumulates, the penalty nudges the kernel
+// to switch to its second-best candidate slightly earlier, breaking up
+// "lines of the same dither dot" without dirtying clean areas.
+const SAME_INK_PENALTY = 0.003;
+function _v2ensure() {
+  if (_v2lut) return;
+  _v2lut = new Float32Array(256);
+  for (let i = 0; i < 256; i++) {
+    const c = i / 255;
+    _v2lut[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  }
+  _v2pal = EPD_PALETTE_PANEL.map(p => [_v2lut[p[0]], _v2lut[p[1]], _v2lut[p[2]]]);
+  // Linear-light Rec.709 luma per ink (pre-computed once).
+  _v2pal_luma = _v2pal.map(p => 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]);
+}
+function _v2smoothstep(e0, e1, x) {
+  if (e1 <= e0) return x >= e1 ? 1 : 0;
+  let t = (x - e0) / (e1 - e0);
+  t = t < 0 ? 0 : (t > 1 ? 1 : t);
+  return t * t * (3 - 2 * t);
+}
+
+// Pre-pass for the two error-diffusion modes (Sharp / Smooth): adaptively
+// reduce the input to a 64-colour palette derived from the image's own colour
+// distribution (Gervautz-Purgathofer octree). Cheap streaming algorithm:
+//   1. Build: each pixel walks down the octree by R/G/B high bits (level 0
+//      picks bit 7, level 1 bit 6, ...). At MAX_DEPTH the deepest reached
+//      node becomes a leaf and accumulates the pixel's count + colour sum.
+//   2. Reduce: while leafCount > 64, find the deepest "internal node whose
+//      children are all leaves" with the smallest total pixel count and
+//      merge those leaves into the parent (parent becomes a single leaf
+//      holding the summed colour). This sacrifices the colour bins seen by
+//      the fewest pixels first -- visually closest matches survive.
+//   3. Quantise: each pixel walks the tree again until a leaf, replaces
+//      itself with that leaf's average colour.
+// Result vs a uniform RGB cube: dark / single-tone images get more useful
+// palette slots in the range they actually occupy, instead of wasting bins on
+// colours that don't appear in the image.
+//
+// Caller passes maxColours (32 / 64 / 128 / 256). Pass 0 to skip reduction
+// entirely (full source colour passes through unchanged).
+function reduceInputToN(imageData, maxColours) {
+  if (!maxColours || maxColours <= 0) return;
+  const data = imageData.data;
+  const MAX_DEPTH = 5;  // levels 0..4; deepest leaves use bits 7..3 (5-bit precision)
+  const MAX_COLOURS = maxColours;
+
+  const makeNode = () => ({
+    children: [null, null, null, null, null, null, null, null],
+    isLeaf: false,
+    pixelCount: 0,
+    rSum: 0, gSum: 0, bSum: 0,
+    avgR: 0, avgG: 0, avgB: 0,
+  });
+
+  const root = makeNode();
+  // internal[l] = every node born at depth l (regardless of current leaf state).
+  // Used during reduction to scan candidates per level.
+  const internal = Array.from({length: MAX_DEPTH + 1}, () => []);
+  internal[0].push(root);
+  let leafCount = 0;
+
+  // --- Build pass ---
   for (let i = 0; i < data.length; i += 4) {
     const r = data[i], g = data[i + 1], b = data[i + 2];
-    let best = palette[0], bestDist = Infinity;
-    for (let j = 0; j < palette.length; j++) {
-      const c = palette[j];
-      const dist = (r - c[0]) ** 2 + (g - c[1]) ** 2 + (b - c[2]) ** 2;
-      if (dist < bestDist) { bestDist = dist; best = c; }
+    let node = root;
+    for (let level = 0; level < MAX_DEPTH; level++) {
+      if (node.isLeaf) break;  // path was already reduced
+      const shift = 7 - level;
+      const idx = ((r >> shift) & 1) << 2 | ((g >> shift) & 1) << 1 | ((b >> shift) & 1);
+      let child = node.children[idx];
+      if (!child) {
+        child = makeNode();
+        node.children[idx] = child;
+        if (level + 1 === MAX_DEPTH) {
+          child.isLeaf = true;
+          leafCount++;
+        }
+        internal[level + 1].push(child);
+      }
+      node = child;
     }
-    data[i] = best[0]; data[i + 1] = best[1]; data[i + 2] = best[2];
-    data[i + 3] = 255;
+    node.pixelCount++;
+    node.rSum += r; node.gSum += g; node.bSum += b;
   }
+
+  // --- Reduce until leafCount <= MAX_COLOURS ---
+  // Each iteration finds the deepest internal node whose children are all
+  // leaves, with the smallest combined pixel count, and collapses it.
+  while (leafCount > MAX_COLOURS) {
+    let target = null, targetCount = Infinity;
+    for (let l = MAX_DEPTH - 1; l >= 0 && !target; l--) {
+      for (const node of internal[l]) {
+        if (node.isLeaf) continue;
+        let allLeaves = true, hasAny = false, pc = 0;
+        for (const c of node.children) {
+          if (!c) continue;
+          hasAny = true;
+          if (!c.isLeaf) { allLeaves = false; break; }
+          pc += c.pixelCount;
+        }
+        if (!allLeaves || !hasAny) continue;
+        if (pc < targetCount) { target = node; targetCount = pc; }
+      }
+    }
+    if (!target) break;  // no further reduction possible
+
+    let pc = 0, rs = 0, gs = 0, bs = 0, merged = 0;
+    for (let i = 0; i < 8; i++) {
+      const c = target.children[i];
+      if (!c) continue;
+      pc += c.pixelCount;
+      rs += c.rSum;
+      gs += c.gSum;
+      bs += c.bSum;
+      merged++;
+      target.children[i] = null;
+    }
+    target.isLeaf = true;
+    target.pixelCount = pc;
+    target.rSum = rs; target.gSum = gs; target.bSum = bs;
+    leafCount = leafCount - merged + 1;
+  }
+
+  // --- Compute each leaf's representative colour (its mean) ---
+  function setAvg(node) {
+    if (node.isLeaf) {
+      if (node.pixelCount > 0) {
+        node.avgR = Math.round(node.rSum / node.pixelCount);
+        node.avgG = Math.round(node.gSum / node.pixelCount);
+        node.avgB = Math.round(node.bSum / node.pixelCount);
+      }
+      return;
+    }
+    for (const c of node.children) if (c) setAvg(c);
+  }
+  setAvg(root);
+
+  // --- Quantise pass: rewrite each pixel as its leaf's mean colour ---
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    let node = root;
+    for (let level = 0; level < MAX_DEPTH; level++) {
+      if (node.isLeaf) break;
+      const shift = 7 - level;
+      const idx = ((r >> shift) & 1) << 2 | ((g >> shift) & 1) << 1 | ((b >> shift) & 1);
+      const c = node.children[idx];
+      if (c) {
+        node = c;
+      } else {
+        // Path was reduced away in a sibling -- fall back to any existing child.
+        for (const sib of node.children) { if (sib) { node = sib; break; } }
+      }
+    }
+    data[i]     = node.avgR;
+    data[i + 1] = node.avgG;
+    data[i + 2] = node.avgB;
+  }
+}
+
+function quantizeToEpdPaletteV2(imageData) {
+  _v2ensure();
+  const data = imageData.data, w = imageData.width, h = imageData.height;
+  const pal = _v2pal, ink = EPD_PALETTE_PANEL, L = _v2lut, palLuma = _v2pal_luma;
+  const picks = pickColors, pRange = pickRange, pStr = pickStrength, nPicks = picks.length;
+  const lumaW = LUMA_NEIGHBOUR_WEIGHT;
+  const repeatPenalty = SAME_INK_PENALTY;
+  let cur = new Float32Array(w * 3);
+  let nxt = new Float32Array(w * 3);
+  for (let y = 0; y < h; y++) {
+    nxt.fill(0);
+    const l2r = (y & 1) === 0;
+    const xs = l2r ? 0 : w - 1, xe = l2r ? w : -1, fwd = l2r ? 1 : -1;
+    let prevLuma = -1;  // reset per row: no neighbour at row start
+    let prevBest = -1;  // reset per row: no previous ink to repeat from
+    for (let x = xs; x !== xe; x += fwd) {
+      const idx = (y * w + x) * 4, xi = x * 3;
+      let wr = L[data[idx]] + cur[xi], wg = L[data[idx + 1]] + cur[xi + 1], wb = L[data[idx + 2]] + cur[xi + 2];
+      wr = wr < 0 ? 0 : (wr > 1 ? 1 : wr);
+      wg = wg < 0 ? 0 : (wg > 1 ? 1 : wg);
+      wb = wb < 0 ? 0 : (wb > 1 ? 1 : wb);
+      // Nearest-ink, biased by (a) luminance closeness to the just-placed
+      // neighbour and (b) a tiny penalty against picking the same ink twice
+      // in a row. See LUMA_NEIGHBOUR_WEIGHT / SAME_INK_PENALTY for tuning.
+      let best = 0, bd = 1e30;
+      for (let p = 0; p < 6; p++) {
+        const dr = wr - pal[p][0], dg = wg - pal[p][1], db = wb - pal[p][2];
+        let s = dr * dr + dg * dg + db * db;
+        if (prevLuma >= 0) {
+          const ld = palLuma[p] - prevLuma;
+          s += lumaW * ld * ld;
+        }
+        if (p === prevBest) s += repeatPenalty;
+        if (s < bd) { bd = s; best = p; }
+      }
+      prevLuma = palLuma[best];
+      prevBest = best;
+      const rr = wr - pal[best][0], rg = wg - pal[best][1], rb = wb - pal[best][2];
+      let f = 1;
+      if (nPicks > 0 && pStr > 0) {
+        let pm = 0;
+        for (let q = 0; q < nPicks; q++) {
+          const pc = picks[q].lin;
+          const ddr = wr - pc[0], ddg = wg - pc[1], ddb = wb - pc[2];
+          const dp = Math.sqrt(ddr * ddr + ddg * ddg + ddb * ddb);
+          const m = 1 - _v2smoothstep(0, pRange, dp);
+          if (m > pm) pm = m;
+        }
+        f *= (1 - pStr * pm);
+      }
+      data[idx] = ink[best][0]; data[idx + 1] = ink[best][1]; data[idx + 2] = ink[best][2]; data[idx + 3] = 255;
+      if (f > 0) {
+        const er = rr * f, eg = rg * f, eb = rb * f;
+        const xf = x + fwd, xb = x - fwd;
+        if (xf >= 0 && xf < w) { cur[xf * 3] += er * 0.4375; cur[xf * 3 + 1] += eg * 0.4375; cur[xf * 3 + 2] += eb * 0.4375; }
+        if (xb >= 0 && xb < w) { nxt[xb * 3] += er * 0.1875; nxt[xb * 3 + 1] += eg * 0.1875; nxt[xb * 3 + 2] += eb * 0.1875; }
+        nxt[xi] += er * 0.3125; nxt[xi + 1] += eg * 0.3125; nxt[xi + 2] += eb * 0.3125;
+        if (xf >= 0 && xf < w) { nxt[xf * 3] += er * 0.0625; nxt[xf * 3 + 1] += eg * 0.0625; nxt[xf * 3 + 2] += eb * 0.0625; }
+      }
+    }
+    const t = cur; cur = nxt; nxt = t;
+  }
+}
+// Fixed perceptual palette: every way to split N parts among the 6 panel
+// inks (each ink takes 0..N-1 parts; no single ink takes all N, i.e. no
+// pure colours). Each entry's colour is the weighted mean of its component
+// inks in linear light. Cached per parts count.
+//   N=5 -> C(5+5,5) - 6 = 252 -  6 = 246 entries
+//   N=6 -> C(6+5,5) - 6 = 462 -  6 = 456 entries
+//   N=7 -> C(7+5,5) - 6 = 792 -  6 = 786 entries
+const _mixPaletteCache = {};
+function _linToSrgb8(lin) {
+  if (lin <= 0) return 0;
+  if (lin >= 1) return 255;
+  const s = lin <= 0.0031308 ? 12.92 * lin : 1.055 * Math.pow(lin, 1 / 2.4) - 0.055;
+  return Math.round(s * 255);
+}
+function _buildMixPalette(N) {
+  if (_mixPaletteCache[N]) return _mixPaletteCache[N];
+  _v2ensure();
+  const pal = _v2pal;  // 6 linear-light inks
+  const palette = [];
+  // Enumerate compositions of N into 6 non-negative parts, excluding any single N.
+  for (let c0 = 0; c0 <= N; c0++) {
+    for (let c1 = 0; c1 <= N - c0; c1++) {
+      for (let c2 = 0; c2 <= N - c0 - c1; c2++) {
+        for (let c3 = 0; c3 <= N - c0 - c1 - c2; c3++) {
+          for (let c4 = 0; c4 <= N - c0 - c1 - c2 - c3; c4++) {
+            const c5 = N - c0 - c1 - c2 - c3 - c4;
+            const counts = [c0, c1, c2, c3, c4, c5];
+            // Exclude pure ink (one count = N, all others = 0).
+            let pure = false;
+            for (let i = 0; i < 6; i++) if (counts[i] === N) { pure = true; break; }
+            if (pure) continue;
+            let rl = 0, gl = 0, bl = 0;
+            for (let i = 0; i < 6; i++) {
+              rl += counts[i] * pal[i][0];
+              gl += counts[i] * pal[i][1];
+              bl += counts[i] * pal[i][2];
+            }
+            rl /= N; gl /= N; bl /= N;
+            palette.push({
+              lin: [rl, gl, bl],
+              srgb: [_linToSrgb8(rl), _linToSrgb8(gl), _linToSrgb8(bl)],
+            });
+          }
+        }
+      }
+    }
+  }
+  _mixPaletteCache[N] = palette;
+  return palette;
+}
+
+// Snap every pixel to its nearest entry in the Mix-N palette (Euclidean
+// distance in linear RGB). Used as the pre-quantisation step of the Mix mode.
+function reduceInputToMix(imageData, N) {
+  _v2ensure();
+  const data = imageData.data;
+  const L = _v2lut;
+  const palette = _buildMixPalette(N);
+  const nP = palette.length;
+  for (let i = 0; i < data.length; i += 4) {
+    const wr = L[data[i]], wg = L[data[i + 1]], wb = L[data[i + 2]];
+    let best = 0, bd = 1e30;
+    for (let p = 0; p < nP; p++) {
+      const e = palette[p].lin;
+      const dr = wr - e[0], dg = wg - e[1], db = wb - e[2];
+      const d = dr * dr + dg * dg + db * db;
+      if (d < bd) { bd = d; best = p; }
+    }
+    const s = palette[best].srgb;
+    data[i] = s[0]; data[i + 1] = s[1]; data[i + 2] = s[2];
+  }
+}
+
+// "Smart" dispatcher: pure-ink protection error-diffusion at full source
+// colour. Knobs (live from the Smart tuning panel):
+//   ditherKernel: "fs" (Floyd-Steinberg, smoother) | "atkinson" (sharper)
+//   pickColors / pickRange / pickStrength: which colours and how strongly
+//                                         the kernel preserves them.
+function quantizeToEpdPaletteSmart(imageData) {
+  if (ditherKernel === "atkinson") {
+    quantizeToEpdPaletteAtkinson(imageData);
+  } else {
+    quantizeToEpdPaletteV2(imageData);
+  }
+}
+
+// "Mix" dispatcher: fixed N-part mix-of-6 palette pre-quantisation, then
+// kernel. No protection -- the palette is already chosen from colours the
+// EPD can hit by dithering between its inks, so picks/range/strength add
+// nothing useful. Knobs:
+//   ditherKernel: shared with Smart.
+//   mixParts:     4 | 5 | 6 (parts in the mix; see _buildMixPalette).
+function quantizeToEpdPaletteMix(imageData) {
+  reduceInputToMix(imageData, mixParts);
+  // The kernel functions read protection state from global pickColors /
+  // pickRange / pickStrength. Snapshot them, run kernel with empty picks,
+  // then restore. Cheap (small arrays); avoids a second pair of kernels.
+  const _picks = pickColors, _str = pickStrength;
+  pickColors = [];
+  pickStrength = 0;
+  try {
+    if (ditherKernel === "atkinson") {
+      quantizeToEpdPaletteAtkinson(imageData);
+    } else {
+      quantizeToEpdPaletteV2(imageData);
+    }
+  } finally {
+    pickColors = _picks;
+    pickStrength = _str;
+  }
+}
+function exportSmartCanvas() {
+  const source = exportToCanvas();
+  if (!source) return null;
+  const sz = getCanvasSize(), cw = sz[0], ch = sz[1];
+  const canvas = document.createElement("canvas");
+  canvas.width = cw; canvas.height = ch;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return null;
+  ctx.drawImage(source, 0, 0, cw, ch);
+  const imageData = ctx.getImageData(0, 0, cw, ch);
+  quantizeToEpdPaletteSmart(imageData);
+  ctx.putImageData(imageData, 0, 0);
+  return canvas;
+}
+
+function exportMixCanvas() {
+  const source = exportToCanvas();
+  if (!source) return null;
+  const sz = getCanvasSize(), cw = sz[0], ch = sz[1];
+  const canvas = document.createElement("canvas");
+  canvas.width = cw; canvas.height = ch;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx) return null;
+  ctx.drawImage(source, 0, 0, cw, ch);
+  const imageData = ctx.getImageData(0, 0, cw, ch);
+  quantizeToEpdPaletteMix(imageData);
+  ctx.putImageData(imageData, 0, 0);
+  return canvas;
+}
+
+
+// ---- "Sharp" dither: same linear-light + pure-ink protection as Smooth (v2),
+//      but with the Atkinson kernel (6 recipients * 1/8, 2/8 of error dropped)
+//      instead of Floyd-Steinberg (7/3/5/1 over 16). Atkinson is sharper and
+//      keeps near-pure regions cleaner; FS is smoother in gradients. Outputs
+//      exact panel inks so the device pushes via epd_fastest (preview == device). ----
+function quantizeToEpdPaletteAtkinson(imageData) {
+  _v2ensure();
+  const data = imageData.data, w = imageData.width, h = imageData.height;
+  const pal = _v2pal, ink = EPD_PALETTE_PANEL, L = _v2lut, palLuma = _v2pal_luma;
+  const picks = pickColors, pRange = pickRange, pStr = pickStrength, nPicks = picks.length;
+  const lumaW = LUMA_NEIGHBOUR_WEIGHT;
+  const repeatPenalty = SAME_INK_PENALTY;
+  let cur  = new Float32Array(w * 3);
+  let nxt  = new Float32Array(w * 3);
+  let nxt2 = new Float32Array(w * 3);
+  const W = 0.125; // Atkinson weight: 1/8 to each of 6 recipients, 2/8 discarded.
+  for (let y = 0; y < h; y++) {
+    const l2r = (y & 1) === 0;
+    const xs = l2r ? 0 : w - 1, xe = l2r ? w : -1, fwd = l2r ? 1 : -1;
+    let prevLuma = -1;  // reset per row: no neighbour at row start
+    let prevBest = -1;  // reset per row: no previous ink to repeat from
+    for (let x = xs; x !== xe; x += fwd) {
+      const idx = (y * w + x) * 4, xi = x * 3;
+      let wr = L[data[idx]]     + cur[xi];
+      let wg = L[data[idx + 1]] + cur[xi + 1];
+      let wb = L[data[idx + 2]] + cur[xi + 2];
+      wr = wr < 0 ? 0 : (wr > 1 ? 1 : wr);
+      wg = wg < 0 ? 0 : (wg > 1 ? 1 : wg);
+      wb = wb < 0 ? 0 : (wb > 1 ? 1 : wb);
+      // Nearest-ink, biased by (a) luminance closeness to the just-placed
+      // neighbour and (b) a tiny penalty against picking the same ink twice
+      // in a row. See LUMA_NEIGHBOUR_WEIGHT / SAME_INK_PENALTY for tuning.
+      let best = 0, bd = 1e30;
+      for (let p = 0; p < 6; p++) {
+        const dr = wr - pal[p][0], dg = wg - pal[p][1], db = wb - pal[p][2];
+        let s = dr * dr + dg * dg + db * db;
+        if (prevLuma >= 0) {
+          const ld = palLuma[p] - prevLuma;
+          s += lumaW * ld * ld;
+        }
+        if (p === prevBest) s += repeatPenalty;
+        if (s < bd) { bd = s; best = p; }
+      }
+      prevLuma = palLuma[best];
+      prevBest = best;
+      const rr = wr - pal[best][0], rg = wg - pal[best][1], rb = wb - pal[best][2];
+      let f = 1;
+      if (nPicks > 0 && pStr > 0) {
+        let pm = 0;
+        for (let q = 0; q < nPicks; q++) {
+          const pc = picks[q].lin;
+          const ddr = wr - pc[0], ddg = wg - pc[1], ddb = wb - pc[2];
+          const dp = Math.sqrt(ddr * ddr + ddg * ddg + ddb * ddb);
+          const m = 1 - _v2smoothstep(0, pRange, dp);
+          if (m > pm) pm = m;
+        }
+        f *= (1 - pStr * pm);
+      }
+      data[idx] = ink[best][0]; data[idx + 1] = ink[best][1];
+      data[idx + 2] = ink[best][2]; data[idx + 3] = 255;
+      if (f > 0) {
+        const er = rr * f * W, eg = rg * f * W, eb = rb * f * W;
+        const x1 = x + fwd, x2 = x + 2 * fwd, xb = x - fwd;
+        // row y    : (+1*fwd, 0) and (+2*fwd, 0)
+        if (x1 >= 0 && x1 < w) { const k = x1 * 3; cur[k] += er; cur[k + 1] += eg; cur[k + 2] += eb; }
+        if (x2 >= 0 && x2 < w) { const k = x2 * 3; cur[k] += er; cur[k + 1] += eg; cur[k + 2] += eb; }
+        // row y+1  : (-1*fwd, +1), (0, +1), (+1*fwd, +1)
+        if (xb >= 0 && xb < w) { const k = xb * 3; nxt[k] += er; nxt[k + 1] += eg; nxt[k + 2] += eb; }
+        nxt[xi] += er; nxt[xi + 1] += eg; nxt[xi + 2] += eb;
+        if (x1 >= 0 && x1 < w) { const k = x1 * 3; nxt[k] += er; nxt[k + 1] += eg; nxt[k + 2] += eb; }
+        // row y+2  : (0, +2)
+        nxt2[xi] += er; nxt2[xi + 1] += eg; nxt2[xi + 2] += eb;
+      }
+    }
+    // Rotate cur <- nxt, nxt <- nxt2, nxt2 <- recycled (zeroed) buffer.
+    // Must zero AFTER rotation, not at the top of the row -- nxt already
+    // carries (y+1) writes from the previous iteration's nxt2.
+    const old = cur; cur = nxt; nxt = nxt2; nxt2 = old; nxt2.fill(0);
+  }
+}
+function _v2lin3(r, g, b) { _v2ensure(); return [_v2lut[r], _v2lut[g], _v2lut[b]]; }
+function renderPickSwatches() {
+  const box = document.getElementById("pick-swatches");
+  if (!box) return;
+  box.innerHTML = "";
+  pickColors.forEach((p, i) => {
+    const sw = document.createElement("span");
+    sw.title = "点击删除";
+    sw.style.cssText = "width:20px;height:20px;border:1px solid #999;border-radius:3px;cursor:pointer;display:inline-block;background:" + p.css;
+    sw.onclick = () => { pickColors.splice(i, 1); renderPickSwatches(); schedulePreviewInkRender(true); };
+    box.appendChild(sw);
+  });
+}
+function _initDefaultPicks() {
+  _v2ensure();
+  pickColors = EPD_PALETTE_PANEL.map(p => ({ lin: [_v2lut[p[0]], _v2lut[p[1]], _v2lut[p[2]]], css: "rgb(" + p[0] + "," + p[1] + "," + p[2] + ")" }));
+  renderPickSwatches();
+}
+function resetPicks() { _initDefaultPicks(); schedulePreviewInkRender(true); }
+_initDefaultPicks();
+function onPickTuneChange() {
+  const pr = document.getElementById("prange"), ps = document.getElementById("pstr");
+  if (pr) { pickRange = parseFloat(pr.value); const v = document.getElementById("prange-val"); if (v) v.textContent = pickRange.toFixed(2); }
+  if (ps) { pickStrength = parseFloat(ps.value); const v = document.getElementById("pstr-val"); if (v) v.textContent = pickStrength.toFixed(2); }
+  schedulePreviewInkRender(true);
+}
+function onKernelChange() {
+  // Both panels carry a Kernel select (id="dither-kernel" for Smart,
+  // id="mix-kernel" for Mix). Read whichever the current mode owns, then
+  // mirror to the sibling select so a later mode switch shows the right one.
+  const src = displayMode === "mix" ? "mix-kernel" : "dither-kernel";
+  const sel = document.getElementById(src);
+  if (sel) ditherKernel = sel.value;
+  const other = document.getElementById(src === "mix-kernel" ? "dither-kernel" : "mix-kernel");
+  if (other) other.value = ditherKernel;
+  schedulePreviewInkRender(true);
+}
+function onMixPartsChange() {
+  const sel = document.getElementById("mix-parts");
+  if (sel) mixParts = parseInt(sel.value, 10) || 5;
+  schedulePreviewInkRender(true);
+}
+function addPickAt(clientX, clientY) {
+  if (displayMode !== "smart" || !hasCompositionImages()) return;
+  const src = exportToCanvas();
+  if (!src) return;
+  const sz = getCanvasSize(), cw = sz[0], ch = sz[1];
+  const container = getPreviewContainer();
+  if (!container) return;
+  const rect = container.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  let px = Math.floor((clientX - rect.left) / rect.width * cw);
+  let py = Math.floor((clientY - rect.top) / rect.height * ch);
+  px = px < 0 ? 0 : (px >= cw ? cw - 1 : px);
+  py = py < 0 ? 0 : (py >= ch ? ch - 1 : py);
+  const sctx = src.getContext("2d", { willReadFrequently: true });
+  const d = sctx.getImageData(px, py, 1, 1).data;
+  pickColors.push({ lin: _v2lin3(d[0], d[1], d[2]), css: "rgb(" + d[0] + "," + d[1] + "," + d[2] + ")" });
+  renderPickSwatches();
+  schedulePreviewInkRender(true);
 }
 
 function renderPreviewInkEffect() {
@@ -2382,8 +2940,10 @@ function renderPreviewInkEffect() {
     ctx.fillRect(0, 0, cw, ch);
     ctx.drawImage(source, 0, 0, cw, ch);
     const imageData = ctx.getImageData(0, 0, cw, ch);
-    if (displayMode === "nearest") {
-      quantizeToEpdPaletteOriginal(imageData);
+    if (displayMode === "smart") {
+      quantizeToEpdPaletteSmart(imageData);
+    } else if (displayMode === "mix") {
+      quantizeToEpdPaletteMix(imageData);
     } else {
       quantizeToEpdPalette(imageData);
     }
@@ -3003,6 +3563,15 @@ function formatSize(bytes) {
     if (clickedLayer || clickedRemoveBtn || hasCompositionImages()) return;
     document.getElementById("file-input").click();
   });
+  // Click-to-pick colour (Smooth mode). Track pointer movement so a drag/zoom
+  // does not also fire a colour pick.
+  let _pickDX = 0, _pickDY = 0, _pickMoved = false;
+  container.addEventListener("pointerdown", e => { _pickDX = e.clientX; _pickDY = e.clientY; _pickMoved = false; });
+  container.addEventListener("pointermove", e => { if (Math.abs(e.clientX - _pickDX) > 6 || Math.abs(e.clientY - _pickDY) > 6) _pickMoved = true; });
+  container.addEventListener("click", e => {
+    if (displayMode !== "smart" || !hasCompositionImages() || _pickMoved) return;
+    addPickAt(e.clientX, e.clientY);
+  });
   container.addEventListener("dragover", e => { e.preventDefault(); container.style.borderColor = "#336699"; });
   container.addEventListener("dragleave", () => { container.style.borderColor = ""; });
   container.addEventListener("drop", e => {
@@ -3208,6 +3777,10 @@ function resetDisplayModeToDither() {
   document.getElementById("display-mode-label").textContent = "Dither";
   const opts = document.querySelectorAll("#display-mode-menu .display-mode-option");
   opts.forEach(o => o.classList.toggle("selected", o.dataset.val === "dither"));
+  const smTune = document.getElementById("smooth-tune");
+  const mxTune = document.getElementById("mix-tune");
+  if (smTune) smTune.classList.add("hidden");
+  if (mxTune) mxTune.classList.add("hidden");
 }
 
 function toggleDisplayModeDropdown() {
@@ -3220,11 +3793,17 @@ function toggleDisplayModeDropdown() {
 
 function selectDisplayMode(val) {
   displayMode = val;
-  document.getElementById("display-mode-label").textContent = val === "dither" ? "Dither" : "Nearest";
+  const labels = { dither: "Dither", smart: "Smart", mix: "Mix" };
+  document.getElementById("display-mode-label").textContent = labels[val] || "Dither";
   const opts = document.querySelectorAll("#display-mode-menu .display-mode-option");
   opts.forEach(o => o.classList.toggle("selected", o.dataset.val === val));
   document.getElementById("display-mode-menu").classList.add("hidden");
   document.getElementById("display-mode-wrap").classList.remove("open");
+  // Each mode owns its own tuning panel.
+  const smTune = document.getElementById("smooth-tune");
+  const mxTune = document.getElementById("mix-tune");
+  if (smTune) smTune.classList.toggle("hidden", val !== "smart");
+  if (mxTune) mxTune.classList.toggle("hidden", val !== "mix");
   schedulePreviewInkRender(true);
 }
 
@@ -3292,8 +3871,14 @@ function exportPreviewInkCanvas() {
   return canvas;
 }
 
+function exportCanvasForMode() {
+  if (displayMode === "smart") return exportSmartCanvas();
+  if (displayMode === "mix")   return exportMixCanvas();
+  return exportToCanvas();
+}
+
 async function uploadOnly() {
-  const canvas = exportToCanvas();
+  const canvas = exportCanvasForMode();
   if (!canvas) { showToast("Please select an image first", "error"); return; }
   try {
     const blob = await new Promise((resolve, reject) => {
@@ -3309,23 +3894,16 @@ async function uploadOnly() {
     formData.append("action", "upload_only");
     formData.append("algorithm", displayMode);
     showToast("Uploading...", "");
-    const resp = await apiCall("POST", "/api/photos/upload", formData, true);
+    await apiCall("POST", "/api/photos/upload", formData, true);
     showToast("Uploaded successfully", "success");
-    if (displayMode === "nearest" && resp && resp.name) {
-      // Nearest photo inserts at front — all page boundaries shift, clear page cache
-      photoPageCache = {};
-      const m = resp.name.match(/^imageN0*(\d+)/i);
-      if (m) photoPage = Math.ceil(Number(m[1]) / getPhotoPerPage());
-    } else {
-      photoPage = 9999;
-    }
+    photoPage = 9999;
     await loadPhotoList(photoPage, /* forceRefresh */ true);
     loadStorage();
   } catch(e) { showToast(e.message, "error"); }
 }
 
 async function uploadWithDisplay() {
-  const canvas = exportToCanvas();
+  const canvas = exportCanvasForMode();
   if (!canvas) { showToast("Please select an image first", "error"); return; }
 
   try {
@@ -3345,17 +3923,10 @@ async function uploadWithDisplay() {
     formData.append("algorithm", displayMode);
 
     showToast("Uploading...", "");
-    const resp = await apiCall("POST", "/api/photos/upload", formData, true);
+    await apiCall("POST", "/api/photos/upload", formData, true);
     showToast("Uploaded & display updated", "success");
-    // Compute which page the new photo landed on from its name
-    if (displayMode === "nearest" && resp && resp.name) {
-      // Nearest photo inserts at front — all pages shift, clear page cache
-      photoPageCache = {};
-      const m = resp.name.match(/^imageN0*(\d+)/i);
-      if (m) photoPage = Math.ceil(Number(m[1]) / getPhotoPerPage());
-    } else {
-      photoPage = 9999; // Dither appends at end, only last page changes
-    }
+    // All modes append at the end now — jump to the last page.
+    photoPage = 9999;
     await loadPhotoList(photoPage, /* forceRefresh */ true);
     loadStorage();
   } catch(e) { showToast(e.message, "error"); }
